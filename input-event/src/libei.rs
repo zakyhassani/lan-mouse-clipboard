@@ -67,7 +67,7 @@ fn to_input_events(ei_event: EiEvent) -> Events {
         EiEvent::Frame(_) => Events::None, /* FIXME */
         EiEvent::PointerMotion(motion) => {
             let motion_event = PointerEvent::Motion {
-                time: motion.time as u32,
+                time: (motion.time / 1000) as u32,
                 dx: motion.dx as f64,
                 dy: motion.dy as f64,
             };
@@ -76,7 +76,11 @@ fn to_input_events(ei_event: EiEvent) -> Events {
         EiEvent::PointerMotionAbsolute(_) => Events::None,
         EiEvent::Button(button) => {
             let button_event = PointerEvent::Button {
-                time: button.time as u32,
+                // EIS timestamps are microseconds of CLOCK_MONOTONIC; the
+                // Wayland wl_pointer.button time is in milliseconds, so
+                // convert here or the remote toolkit sees an inter-click
+                // delta inflated by 1000x and never detects a double-click.
+                time: (button.time / 1000) as u32,
                 button: button.button,
                 state: match button.state {
                     ButtonState::Released => 0,
@@ -134,7 +138,7 @@ fn to_input_events(ei_event: EiEvent) -> Events {
                     KeyState::Press => 1,
                     KeyState::Released => 0,
                 },
-                time: key.time as u32,
+                time: (key.time / 1000) as u32,
             };
             Events::One(Event::Keyboard(key_event))
         }
