@@ -17,6 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
+use lan_mouse_clipboard::BackendKind;
 use lan_mouse_ipc::{DEFAULT_PORT, Position};
 
 use input_event::scancode::{
@@ -69,6 +70,14 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    clipboard: Option<ClipboardConfig>,
+}
+
+/// Clipboard sync settings.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
+struct ClipboardConfig {
+    enabled: Option<bool>,
+    backend: Option<BackendKind>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -450,6 +459,31 @@ impl Config {
     /// path to certificate
     pub fn cert_path(&self) -> &Path {
         &self.cert_path
+    }
+
+    /// whether clipboard sync is enabled
+    pub fn clipboard_enabled(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard.as_ref())
+            .and_then(|cb| cb.enabled)
+            .unwrap_or(false)
+    }
+
+    /// the clipboard backend to use
+    pub fn clipboard_backend(&self) -> BackendKind {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard.as_ref())
+            .and_then(|cb| cb.backend)
+            .unwrap_or(BackendKind::Auto)
+    }
+
+    /// set whether clipboard sync is enabled
+    pub fn set_clipboard_enabled(&mut self, enabled: bool) {
+        let toml = self.config_toml.get_or_insert_with(Default::default);
+        let cb = toml.clipboard.get_or_insert_with(Default::default);
+        cb.enabled = Some(enabled);
     }
 
     /// optional input-capture backend override

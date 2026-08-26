@@ -64,6 +64,8 @@ enum CliSubcommand {
     EnableCapture,
     /// re-enable emulation
     EnableEmulation,
+    /// enable or disable clipboard sync
+    SetClipboard { enabled: bool },
     /// authorize a public key
     AuthorizeKey {
         description: String,
@@ -150,6 +152,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::EnableCapture => tx.request(FrontendRequest::EnableCapture).await?,
         CliSubcommand::EnableEmulation => tx.request(FrontendRequest::EnableEmulation).await?,
+        CliSubcommand::SetClipboard { enabled } => {
+            tx.request(FrontendRequest::EnableClipboard(enabled))
+                .await?
+        }
         CliSubcommand::AuthorizeKey {
             description,
             sha256_fingerprint,

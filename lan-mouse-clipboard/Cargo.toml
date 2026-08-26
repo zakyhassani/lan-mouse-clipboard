@@ -1,0 +1,40 @@
+[package]
+name = "lan-mouse-clipboard"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Clipboard sync transport, framing and backends for lan-mouse"
+
+[dependencies]
+tokio = { version = "1.32.0", features = [
+    "io-util",
+    "net",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+] }
+futures = "0.3.28"
+async-trait = "0.1.83"
+rustls = { version = "0.23.12", default-features = false, features = ["std", "ring"] }
+tokio-rustls = { version = "0.26", features = ["ring"] }
+rustls-pemfile = "2.1.0"
+sha2 = "0.10.8"
+thiserror = "2.0.0"
+log = "0.4.20"
+serde = { version = "1.0", features = ["derive"] }
+tokio-stream = { version = "0.1.15", features = ["io-util"] }
+
+[dev-dependencies]
+rcgen = "0.13.1"
+env_logger = "0.11.3"
+
+[features]
+default = ["dummy", "wl-clipboard", "cliphist"]
+dummy = []
+wl-clipboard = []
+cliphist = []
+klipper = []
+dbus = []

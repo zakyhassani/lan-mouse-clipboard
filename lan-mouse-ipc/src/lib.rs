@@ -204,6 +204,8 @@ pub enum FrontendEvent {
     CaptureStatus(Status),
     /// emulation status
     EmulationStatus(Status),
+    /// clipboard sync status
+    ClipboardStatus(Status),
     /// authorized public key fingerprints have been updated
     AuthorizedUpdated(HashMap<String, String>),
     /// public key fingerprint of this device
@@ -251,6 +253,8 @@ pub enum FrontendRequest {
     EnableCapture,
     /// request reenabling input emulation
     EnableEmulation,
+    /// enable/disable clipboard sync
+    EnableClipboard(bool),
     /// synchronize all state
     Sync,
     /// authorize fingerprint (description, fingerprint)
