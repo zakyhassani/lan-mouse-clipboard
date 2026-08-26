@@ -105,6 +105,22 @@
                     </child>
                     <child>
                       <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Clipboard</property>
+                        <child>
+                          <object class="AdwActionRow">
+                            <property name="title" translatable="yes">Sync clipboard between devices</property>
+                            <property name="subtitle" translatable="yes">share copied text over the local network</property>
+                            <child type="suffix">
+                              <object class="GtkSwitch" id="clipboard_switch">
+                                <property name="valign">center</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
                         <property name="title" translatable="yes">General</property>
                         <!--
                         <child>

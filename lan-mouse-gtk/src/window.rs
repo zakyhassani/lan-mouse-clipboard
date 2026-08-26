@@ -410,6 +410,10 @@ impl Window {
         self.request(FrontendRequest::EnableEmulation);
     }
 
+    fn request_clipboard(&self, active: bool) {
+        self.request(FrontendRequest::EnableClipboard(active));
+    }
+
     fn request_client_create(&self) {
         self.request(FrontendRequest::Create);
     }
@@ -466,6 +470,26 @@ impl Window {
     pub(super) fn set_emulation(&self, active: bool) {
         self.imp().emulation_active.replace(active);
         self.update_capture_emulation_status();
+    }
+
+    pub(super) fn setup_clipboard(&self) {
+        let imp = self.imp();
+        let switch = imp.clipboard_switch.get();
+        switch.set_active(imp.clipboard_active.get());
+        switch.connect_active_notify(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |switch| {
+                let active = switch.is_active();
+                window.set_clipboard(active);
+                window.request_clipboard(active);
+            }
+        ));
+    }
+
+    pub(super) fn set_clipboard(&self, active: bool) {
+        self.imp().clipboard_active.replace(active);
+        self.imp().clipboard_switch.get().set_active(active);
     }
 
     #[cfg(target_os = "macos")]

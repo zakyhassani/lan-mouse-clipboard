@@ -281,6 +281,7 @@ fn build_ui(app: &Application) {
                     FrontendEvent::PortChanged(port, msg) => window.update_port(port, msg),
                     FrontendEvent::CaptureStatus(s) => window.set_capture(s.into()),
                     FrontendEvent::EmulationStatus(s) => window.set_emulation(s.into()),
+                    FrontendEvent::ClipboardStatus(s) => window.set_clipboard(s.into()),
                     FrontendEvent::AuthorizedUpdated(keys) => window.set_authorized_keys(keys),
                     FrontendEvent::PublicKeyFingerprint(fp) => window.set_pk_fp(&fp),
                     FrontendEvent::ConnectionAttempt { fingerprint } => {

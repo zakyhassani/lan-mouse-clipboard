@@ -9,6 +9,7 @@ use crate::{
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
+use lan_mouse_clipboard::{ClipboardEvent, network, transport};
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
@@ -67,6 +68,12 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// clipboard sync subsystem (driver runs as a spawned task)
+    clipboard: Option<lan_mouse_clipboard::Clipboard>,
+    /// clipboard network task handle (TLS listener + pool)
+    clipboard_task: Option<tokio::task::JoinHandle<()>>,
+    /// status of clipboard sync (enabled / disabled)
+    clipboard_status: Status,
 }
 
 #[derive(Debug)]
@@ -106,6 +113,10 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+
+        // clipboard sync subsystem
+        let (clipboard, clipboard_task) = setup_clipboard(&config, &public_key_fingerprint).await;
+
         let service = Self {
             config,
             capture,
@@ -123,6 +134,9 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            clipboard,
+            clipboard_task,
+            clipboard_status: Default::default(),
         };
         Ok(service)
     }
@@ -147,6 +161,9 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = self.clipboard.as_mut().expect("clipboard").event() => {
+                    self.handle_clipboard_event(event)
+                }
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -159,8 +176,25 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("terminating clipboard ...");
+        if let Some(task) = self.clipboard_task.take() {
+            task.abort();
+        }
 
         Ok(())
+    }
+
+    fn handle_clipboard_event(&mut self, event: ClipboardEvent) {
+        match event {
+            ClipboardEvent::Enabled => {
+                self.clipboard_status = Status::Enabled;
+                self.notify_frontend(FrontendEvent::ClipboardStatus(Status::Enabled));
+            }
+            ClipboardEvent::Disabled => {
+                self.clipboard_status = Status::Disabled;
+                self.notify_frontend(FrontendEvent::ClipboardStatus(Status::Disabled));
+            }
+        }
     }
 
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
@@ -188,6 +222,13 @@ impl Service {
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
             FrontendRequest::EnableEmulation => self.emulation.reenable(),
+            FrontendRequest::EnableClipboard(enabled) => {
+                if let Some(clipboard) = self.clipboard.as_ref() {
+                    clipboard.set_enabled(enabled);
+                }
+                self.config.set_clipboard_enabled(enabled);
+                self.save_config();
+            }
             FrontendRequest::Enumerate() => self.enumerate(),
             FrontendRequest::UpdateFixIps(handle, fix_ips) => {
                 self.update_fix_ips(handle, fix_ips);
@@ -383,6 +424,7 @@ impl Service {
         self.enumerate();
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+        self.notify_frontend(FrontendEvent::ClipboardStatus(self.clipboard_status));
         self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
@@ -607,4 +649,98 @@ impl Service {
             }
         });
     }
+}
+
+/// Build the clipboard subsystem and spawn its network task.
+async fn setup_clipboard(
+    config: &Config,
+    public_key_fingerprint: &str,
+) -> (
+    Option<lan_mouse_clipboard::Clipboard>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(64);
+    let (broadcast_tx, broadcast_rx) = tokio::sync::mpsc::channel(64);
+    let origin = lan_mouse_clipboard::item::origin_from_fingerprint(public_key_fingerprint);
+    let clipboard = lan_mouse_clipboard::Clipboard::new(
+        config.clipboard_enabled(),
+        config.clipboard_backend(),
+        origin,
+        inbound_rx,
+        broadcast_tx,
+    );
+    let task = match setup_clipboard_network(
+        config.cert_path(),
+        config.port(),
+        config.authorized_fingerprints(),
+        config,
+        inbound_tx,
+        broadcast_rx,
+    )
+    .await
+    {
+        Ok(t) => Some(t),
+        Err(e) => {
+            log::warn!("clipboard network disabled: {e}");
+            None
+        }
+    };
+    (Some(clipboard), task)
+}
+
+/// Bind the clipboard TLS listener and spawn the network task.
+async fn setup_clipboard_network(
+    cert_path: &std::path::Path,
+    port: u16,
+    authorized: HashMap<String, String>,
+    config: &Config,
+    inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    broadcast_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> Result<tokio::task::JoinHandle<()>, transport::TransportError> {
+    let pem = std::fs::read_to_string(cert_path)?;
+    let identity = transport::load_identity(&pem)?;
+    let client_config = transport::client_config(&identity)?;
+    let listener = transport::TlsListener::bind(
+        SocketAddr::from(([0, 0, 0, 0], port)),
+        &identity,
+        authorized.clone(),
+    )
+    .await?;
+    // Endpoints for every configured client (one channel per peer). To avoid
+    // two peers connecting to each other and each keeping a different half of
+    // the pair, only the machine with the lexicographically larger certificate
+    // fingerprint initiates the outgoing connection; the other side just
+    // accepts. `authorized` maps a fingerprint to a client name, which we join
+    // against the configured clients' hostnames to resolve each peer.
+    let my_fp = identity.fingerprint();
+    let name_to_fp: HashMap<&str, &str> = authorized
+        .iter()
+        .map(|(fp, name)| (name.as_str(), fp.as_str()))
+        .collect();
+    let peers: Vec<SocketAddr> = config
+        .clients()
+        .into_iter()
+        .filter_map(|c| {
+            let peer_fp = c
+                .hostname
+                .as_deref()
+                .and_then(|h| name_to_fp.get(h))
+                .copied();
+            let initiates = peer_fp.is_some_and(|fp| my_fp.as_str() > fp);
+            if !initiates {
+                return None;
+            }
+            Some(c)
+        })
+        .flat_map(|c| c.ips.into_iter().map(move |ip| SocketAddr::new(ip, c.port)))
+        .collect();
+    let task = tokio::spawn(network::run_clipboard_server(
+        listener,
+        client_config,
+        peers,
+        inbound_tx,
+        broadcast_rx,
+        std::time::Duration::from_secs(60),
+    ));
+    Ok(task)
 }
