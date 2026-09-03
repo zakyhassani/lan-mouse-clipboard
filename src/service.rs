@@ -74,6 +74,10 @@ pub struct Service {
     clipboard_task: Option<tokio::task::JoinHandle<()>>,
     /// status of clipboard sync (enabled / disabled)
     clipboard_status: Status,
+    /// live clipboard peer addresses, pushed to the clipboard network task.
+    /// Refreshed from the UDP input path's active address so a stale IP in the
+    /// config does not leave the clipboard channel stuck.
+    clipboard_peers: tokio::sync::watch::Sender<Vec<SocketAddr>>,
 }
 
 #[derive(Debug)]
@@ -115,7 +119,8 @@ impl Service {
         let port = config.port();
 
         // clipboard sync subsystem
-        let (clipboard, clipboard_task) = setup_clipboard(&config, &public_key_fingerprint).await;
+        let (clipboard, clipboard_task, clipboard_peers) =
+            setup_clipboard(&config, client_manager.clone(), &public_key_fingerprint).await;
 
         let service = Self {
             config,
@@ -137,6 +142,7 @@ impl Service {
             clipboard,
             clipboard_task,
             clipboard_status: Default::default(),
+            clipboard_peers,
         };
         Ok(service)
     }
@@ -154,6 +160,13 @@ impl Service {
             self.activate_client(handle);
         }
 
+        // Periodically refresh the clipboard peer set so it follows the live
+        // UDP-path address. `active_addr` is written asynchronously by the
+        // connect path (connect.rs) and is not otherwise surfaced as an event,
+        // so without this the watch could stay pinned to a stale configured IP.
+        let mut clipboard_peers_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        clipboard_peers_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
@@ -165,6 +178,7 @@ impl Service {
                     self.handle_clipboard_event(event)
                 }
                 _ = self.config.changed() => self.handle_config_change(),
+                _ = clipboard_peers_tick.tick() => self.refresh_clipboard_peers(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
         }
@@ -301,6 +315,7 @@ impl Service {
             .write()
             .unwrap()
             .clone_from(&authorized_keys);
+        self.refresh_clipboard_peers();
         self.sync_frontend();
     }
 
@@ -391,6 +406,9 @@ impl Service {
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle);
+                // A connection to this client is established: refresh the
+                // clipboard peer set so it follows the live UDP-path IP.
+                self.refresh_clipboard_peers();
             }
         }
     }
@@ -528,6 +546,19 @@ impl Service {
         }
     }
 
+    /// Recompute the live clipboard peer addresses (preferring the UDP-path
+    /// active address of each peer) and push them to the clipboard network
+    /// task. Called when the config changes or a client's connection state
+    /// changes so a stale IP never strands the clipboard channel.
+    fn refresh_clipboard_peers(&self) {
+        let peers = resolve_clipboard_peers(
+            &self.config,
+            &self.client_manager,
+            &self.public_key_fingerprint,
+        );
+        let _ = self.clipboard_peers.send(peers);
+    }
+
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
@@ -560,6 +591,7 @@ impl Service {
             self.capture.create(handle, pos, CaptureType::Default);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
+            self.refresh_clipboard_peers();
         }
     }
 
@@ -654,10 +686,12 @@ impl Service {
 /// Build the clipboard subsystem and spawn its network task.
 async fn setup_clipboard(
     config: &Config,
+    client_manager: ClientManager,
     public_key_fingerprint: &str,
 ) -> (
     Option<lan_mouse_clipboard::Clipboard>,
     Option<tokio::task::JoinHandle<()>>,
+    tokio::sync::watch::Sender<Vec<SocketAddr>>,
 ) {
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(64);
     let (broadcast_tx, broadcast_rx) = tokio::sync::mpsc::channel(64);
@@ -669,13 +703,16 @@ async fn setup_clipboard(
         inbound_rx,
         broadcast_tx,
     );
+    // The clipboard network task re-reads this channel every reconnect tick,
+    // so peer addresses (and their live IPs) can change without a restart.
+    let (peers_tx, peers_rx) = tokio::sync::watch::channel::<Vec<SocketAddr>>(Vec::new());
     let task = match setup_clipboard_network(
         config.cert_path(),
         config.port(),
         config.authorized_fingerprints(),
-        config,
         inbound_tx,
         broadcast_rx,
+        peers_rx,
     )
     .await
     {
@@ -685,7 +722,10 @@ async fn setup_clipboard(
             None
         }
     };
-    (Some(clipboard), task)
+    // Seed the live peer set now; it is refreshed again as clients come up.
+    let peers = resolve_clipboard_peers(config, &client_manager, public_key_fingerprint);
+    let _ = peers_tx.send(peers);
+    (Some(clipboard), task, peers_tx)
 }
 
 /// Bind the clipboard TLS listener and spawn the network task.
@@ -693,9 +733,9 @@ async fn setup_clipboard_network(
     cert_path: &std::path::Path,
     port: u16,
     authorized: HashMap<String, String>,
-    config: &Config,
     inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     broadcast_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    peers_rx: tokio::sync::watch::Receiver<Vec<SocketAddr>>,
 ) -> Result<tokio::task::JoinHandle<()>, transport::TransportError> {
     let pem = std::fs::read_to_string(cert_path)?;
     let identity = transport::load_identity(&pem)?;
@@ -703,44 +743,65 @@ async fn setup_clipboard_network(
     let listener = transport::TlsListener::bind(
         SocketAddr::from(([0, 0, 0, 0], port)),
         &identity,
-        authorized.clone(),
+        authorized,
     )
     .await?;
-    // Endpoints for every configured client (one channel per peer). To avoid
-    // two peers connecting to each other and each keeping a different half of
-    // the pair, only the machine with the lexicographically larger certificate
-    // fingerprint initiates the outgoing connection; the other side just
-    // accepts. `authorized` maps a fingerprint to a client name, which we join
-    // against the configured clients' hostnames to resolve each peer.
-    let my_fp = identity.fingerprint();
-    let name_to_fp: HashMap<&str, &str> = authorized
-        .iter()
-        .map(|(fp, name)| (name.as_str(), fp.as_str()))
-        .collect();
-    let peers: Vec<SocketAddr> = config
-        .clients()
-        .into_iter()
-        .filter_map(|c| {
-            let peer_fp = c
-                .hostname
-                .as_deref()
-                .and_then(|h| name_to_fp.get(h))
-                .copied();
-            let initiates = peer_fp.is_some_and(|fp| my_fp.as_str() > fp);
-            if !initiates {
-                return None;
-            }
-            Some(c)
-        })
-        .flat_map(|c| c.ips.into_iter().map(move |ip| SocketAddr::new(ip, c.port)))
-        .collect();
     let task = tokio::spawn(network::run_clipboard_server(
         listener,
         client_config,
-        peers,
+        peers_rx,
         inbound_tx,
         broadcast_rx,
         std::time::Duration::from_secs(60),
     ));
     Ok(task)
+}
+
+/// Resolve the clipboard peers this host should connect out to.
+///
+/// Endpoints for every configured client (one channel per peer). To avoid two
+/// peers connecting to each other and each keeping a different half of the
+/// pair, only the machine with the lexicographically larger certificate
+/// fingerprint initiates the outgoing connection; the other side just accepts.
+/// `authorized` maps a fingerprint to a client name, which we join against the
+/// configured clients' hostnames to resolve each peer.
+///
+/// The peer IP is taken from the *live* UDP-path address (`active_addr`) when
+/// available so a stale IP in `config.toml` (e.g. after DHCP) does not leave
+/// the clipboard channel stuck; it falls back to the configured IPs otherwise.
+fn resolve_clipboard_peers(
+    config: &Config,
+    client_manager: &ClientManager,
+    my_fp: &str,
+) -> Vec<SocketAddr> {
+    let authorized = config.authorized_fingerprints();
+    let name_to_fp: HashMap<&str, &str> = authorized
+        .iter()
+        .map(|(fp, name)| (name.as_str(), fp.as_str()))
+        .collect();
+    client_manager
+        .get_client_states()
+        .into_iter()
+        .flat_map(|(_handle, c, s)| {
+            let peer_fp = c
+                .hostname
+                .as_deref()
+                .and_then(|h| name_to_fp.get(h))
+                .copied();
+            let initiates = peer_fp.is_some_and(|fp| my_fp > fp);
+            if !initiates {
+                return Vec::new();
+            }
+            // Prefer the single live UDP-path IP; when none is known yet fall
+            // back to every configured/dns ip so a valid alternate is not
+            // dropped (s.ips is a HashSet, so picking one would be arbitrary).
+            let ips: Vec<IpAddr> = match s.active_addr {
+                Some(a) => vec![a.ip()],
+                None => s.ips.iter().copied().collect(),
+            };
+            ips.into_iter()
+                .map(|ip| SocketAddr::new(ip, c.port))
+                .collect()
+        })
+        .collect()
 }
