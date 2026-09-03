@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, ReadHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::protocol::FrameReader;
 use crate::registry::{ConnKind, ConnectionRegistry};
@@ -27,7 +27,7 @@ pub struct NetworkError;
 pub async fn run_clipboard_server(
     listener: TlsListener,
     client_config: ClientConfig,
-    peers: Vec<SocketAddr>,
+    mut peers: watch::Receiver<Vec<SocketAddr>>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     mut broadcast_rx: mpsc::Receiver<Vec<u8>>,
     idle_timeout: Duration,
@@ -50,6 +50,9 @@ pub async fn run_clipboard_server(
     loop {
         tokio::select! {
             _ = reconnect.tick() => {
+                // Re-read the peer set each tick so clipboard follows the
+                // live UDP-path address of each peer (and drops stale IPs).
+                let peers = peers.borrow_and_update().clone();
                 spawn_connections(&client_config, &peers, &connected, &conn_tx);
             }
             established = conn_rx.recv() => {
@@ -248,10 +251,14 @@ mod tests {
         let cfg_a = client_config(&a.identity).expect("cfg a");
         let cfg_b = client_config(&b.identity).expect("cfg b");
 
+        // A initiates to B; B only listens/accepts.
+        let (peers_a_tx, peers_a_rx) = watch::channel(vec![addr_b]);
+        let (peers_b_tx, peers_b_rx) = watch::channel::<Vec<SocketAddr>>(Vec::new());
+
         tokio::spawn(run_clipboard_server(
             listener_a,
             cfg_a,
-            vec![addr_b],
+            peers_a_rx,
             in_a_tx,
             bc_a_rx,
             Duration::from_secs(60),
@@ -262,11 +269,14 @@ mod tests {
         tokio::spawn(run_clipboard_server(
             listener_b,
             cfg_b,
-            vec![],
+            peers_b_rx,
             in_b_tx,
             bc_b_rx,
             Duration::from_secs(60),
         ));
+        // Keep the senders alive so the receivers keep yielding the latest value.
+        let _ = peers_a_tx;
+        let _ = peers_b_tx;
 
         // Give the connections time to establish.
         tokio::time::sleep(Duration::from_millis(500)).await;
