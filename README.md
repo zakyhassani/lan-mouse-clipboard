@@ -7,6 +7,10 @@
 > Lan Mouse project. All rights to the original code and project belong to their respective original
 > creator(s).
 
+> [!TIP]
+> A detailed description of how clipboard sync works (transport, wire protocol, loop
+> prevention, connection handling and backends) lives in [CLIPBOARD.md](./CLIPBOARD.md).
+
 Lan Mouse is a *cross-platform* mouse and keyboard sharing software similar to universal-control on Apple devices.
 It allows for using multiple PCs via a single set of mouse and keyboard.
 This is also known as a Software KVM switch.
