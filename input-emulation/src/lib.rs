@@ -32,6 +32,19 @@ mod error;
 
 pub type EmulationHandle = u64;
 
+/// Which edge of this (receiving) host a peer just entered from. Used to move
+/// the local cursor to the correct monitor when a host with multiple monitors
+/// is entered, since input emulation is otherwise purely relative and would
+/// otherwise resume from wherever the cursor last sat (which can be the wrong
+/// monitor of the pair).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PointerSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
     #[cfg(wlroots)]
@@ -178,6 +191,20 @@ impl InputEmulation {
         self.emulation.terminate().await
     }
 
+    /// Move the cursor of the given emulation handle to the outer edge on
+    /// `side`. Used when this host is entered from a peer so the cursor lands
+    /// on the correct (seam) monitor even when the host has several monitors.
+    /// Backends that cannot position the cursor absolutely (or without monitor
+    /// layout knowledge) fall back to a no-op and let the pointer resume from
+    /// its current position.
+    pub async fn warp_to_edge(
+        &mut self,
+        handle: EmulationHandle,
+        side: PointerSide,
+    ) -> Result<(), EmulationError> {
+        self.emulation.warp_to_edge(handle, side).await
+    }
+
     pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
         if let Some(keys) = self.pressed_keys.get_mut(&handle) {
             let keys = keys.drain().collect::<Vec<_>>();
@@ -237,4 +264,14 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+
+    /// Position the pointer of `handle` at the outer edge on `side`.
+    /// Defaults to a no-op; backends with the capability override it.
+    async fn warp_to_edge(
+        &mut self,
+        _handle: EmulationHandle,
+        _side: PointerSide,
+    ) -> Result<(), EmulationError> {
+        Ok(())
+    }
 }

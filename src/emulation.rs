@@ -1,7 +1,7 @@
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
-use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
+use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, PointerSide};
 use input_event::Event;
 use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -153,6 +153,10 @@ impl ListenTask {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    // land the local cursor on the seam monitor we were entered
+                                    // from, instead of wherever it happened to be last (relative
+                                    // emulation does not move it by itself).
+                                    self.emulation_proxy.position(addr, to_side(pos));
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
                             }
@@ -237,6 +241,8 @@ pub(crate) struct EmulationProxy {
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
+    /// warp the cursor of the given incoming connection to its seam side
+    Position(SocketAddr, PointerSide),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -292,6 +298,12 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn position(&self, addr: SocketAddr, side: PointerSide) {
+        self.request_tx
+            .send(ProxyRequest::Position(addr, side))
+            .expect("channel closed");
+    }
+
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
@@ -331,6 +343,7 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Position(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -397,6 +410,19 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                     },
+                    ProxyRequest::Position(addr, side) => {
+                        let handle = match self.handles.get(&addr) {
+                            Some(&handle) => handle,
+                            None => {
+                                let handle = self.next_id;
+                                self.next_id += 1;
+                                emulation.create(handle).await;
+                                self.handles.insert(addr, handle);
+                                handle
+                            }
+                        };
+                        emulation.warp_to_edge(handle, side).await?;
+                    },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
@@ -419,11 +445,21 @@ fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
     }
 }
 
+fn to_side(pos: Position) -> PointerSide {
+    match pos {
+        Position::Left => PointerSide::Left,
+        Position::Right => PointerSide::Right,
+        Position::Top => PointerSide::Top,
+        Position::Bottom => PointerSide::Bottom,
+    }
+}
+
 async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::Position(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }
