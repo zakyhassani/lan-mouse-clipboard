@@ -135,9 +135,11 @@ logic on the wire. Each frame is:
 [len: u32 BE][payload]
 ```
 
-`payload` is `[kind: u8][fields...]`. There is one message kind today:
+`payload` is `[kind: u8][fields...]`. The message kinds are:
 
 - `Announce (kind = 1)`: share a single clipboard item.
+- `Ping (kind = 2)`: liveness probe (health check).
+- `Pong (kind = 3)`: reply to a `Ping`.
 
 ```mermaid
 flowchart LR
@@ -260,17 +262,28 @@ Its design:
 - **One live channel per peer** is enough for bidirectional sync; broadcast
   frames are written to every live channel.
 - The **listener is always open** for incoming peers and is never idle-evicted.
+  Accepting runs in its own task, *not* inside the network loop's `select!`, so
+  a timer winning the race can never cancel a TLS handshake mid-flight and drop
+  the connection.
 - For configured peers, the task **lazily establishes an outgoing connection**
-  in a background task (so connect attempts never block the accept loop, which
-  would otherwise deadlock two peers connecting to each other). It re-attempts
-  on a 5-second reconnect tick.
+  in a background task (so connect attempts never block). At most one dial per
+  peer is in flight at a time.
+- **Health check**: every second the task sends a `Ping` on each live channel
+  and expects a `Pong`; a peer with no `Pong` within 3 seconds is considered
+  dead, is dropped, and triggers IP re-training.
+- **Reconnect is the fallback**: outgoing connections are re-attempted only
+  while a known peer has no live channel (initial connect) or immediately after
+  a health check fails — there is no blind periodic reconnect while healthy.
 - **Idle eviction**: outgoing connections are evicted after 60 seconds of
   inactivity; incoming connections are not. Eviction is only attempted when a
   broadcast happens.
 - **Failure handling**: when a peer closes its side, its read loop notifies the
   network task, which drops the stale channel and clears the "connected" marker
-  so the reconnect tick re-establishes it. This prevents getting stuck in
+  so the fallback reconnect re-establishes it. This prevents getting stuck in
   CLOSE-WAIT holding a stale write half.
+- **IP re-training**: every new connection (either direction) and every health
+  failure raises a `Retrain` event, prompting the service to re-derive peer
+  addresses from the live UDP path.
 
 ```mermaid
 flowchart LR
@@ -282,10 +295,12 @@ flowchart LR
         PST["TLS listener"]
     end
 
-    LST -->|accept + fingerprint check| LPOOL
+    LST -->|"accept task<br/>(+ fingerprint check)"| LPOOL
     LPOOL -->|"outgoing connect (lazy, bg task)"| PST
 
-    RCL["5 s reconnect tick"] --> LPOOL
+    HC["1 s health check<br/>Ping / Pong"] --> LPOOL
+    RCL["fallback reconnect<br/>(only while not connected / after health fail)"] --> LPOOL
+    RET["Retrain event -> service<br/>(on connect + on health fail)"] -.-> LPOOL
     LPOOL -->|broadcast to every live channel| PST
     PCL["peer closes / read loop"] -->|discard + clear marker| LPOOL
 
@@ -318,14 +333,22 @@ hands out a new lease) used to leave the clipboard TCP connection stuck in
 SYN-SENT while the UDP input path still worked via the live address.
 
 Instead, `service.rs` resolves clipboard peers from the **live UDP-path
-address** of each peer (`ClientManager.active_addr`) when available, and only
-falls back to the configured/DNS IPs when none is known yet. The result is
-pushed to the network task through a `watch` channel:
+address** of each peer (`ClientManager.active_addr`) when available. Each peer
+gets **exactly one active endpoint**; every other registered IP is kept as an
+ordered **fallback** (not dialed while the active endpoint is live). The result
+is pushed to the network task through a `watch` channel:
 
 - It is seeded at startup and refreshed whenever the config changes, a client is
-  activated/deactivated, or a connection is established.
-- The network task re-reads the channel on every 5-second reconnect tick, so
-  peer addresses (and their live IPs) can change without a restart.
+  activated/deactivated, or a `Retrain` event arrives from the network task
+  (raised on every new connection and on every health-check failure). The
+  service also re-derives it on a 5-second safety tick.
+- The network task re-reads the channel whenever it changes, so peer addresses
+  (and their live IPs) can change without a restart.
+- Only **one live channel per peer** is kept. The network task dials the peer's
+  active endpoint first; if that dial fails it rotates to the next fallback, and
+  it prunes redundant/stale channels (a second outgoing channel to the same
+  peer, or a duplicate incoming channel from the same peer IP) so the old
+  "dial every resolved IP" duplicates cannot persist.
 
 ```mermaid
 sequenceDiagram
@@ -337,10 +360,12 @@ sequenceDiagram
     participant P as peer listener
 
     M->>S: live active_addr (IP may change)
-    Note over S: resolve_clipboard_peers:<br/>active_addr ? active_addr : configured/DNS IPs
+    Note over S: resolve_clipboard_peers:<br/>one active endpoint per peer<br/>+ other IPs as ordered fallbacks
     S-->>W: push peer endpoints
-    Note over N: reconnect tick (5 s) re-reads W
-    N-->>P: lazy TLS connect to live endpoint
+    N-->>S: Retrain (on connect / health fail)
+    S-->>W: re-derive + push again
+    Note over N: reads W on change<br/>(+ 5 s safety tick)
+    N-->>P: TLS connect to active endpoint<br/>(rotate to fallback on failure)
     Note over S: also refreshed on config change /<br/>client activate or deactivate
 ```
 

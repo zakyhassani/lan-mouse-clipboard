@@ -386,6 +386,7 @@ mod tests {
                 assert!(item.serial >= 1, "serial should be allocated");
                 assert_eq!(item.text_plain().as_deref(), Some("hi"));
             }
+            other => panic!("expected Announce, got {other:?}"),
         }
     }
 

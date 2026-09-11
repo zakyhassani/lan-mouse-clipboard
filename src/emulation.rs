@@ -69,6 +69,8 @@ pub(crate) enum EmulationEvent {
 enum EmulationRequest {
     Reenable,
     Release(SocketAddr),
+    /// warp this host's own cursor to a seam side
+    LocalWarp(PointerSide),
     ChangePort(u16),
     Terminate,
 }
@@ -104,6 +106,13 @@ impl Emulation {
     pub(crate) fn reenable(&self) {
         self.request_tx
             .send(EmulationRequest::Reenable)
+            .expect("channel closed");
+    }
+
+    /// Warp this host's own cursor to a seam side when local control resumes.
+    pub(crate) fn local_warp(&self, side: PointerSide) {
+        self.request_tx
+            .send(EmulationRequest::LocalWarp(side))
             .expect("channel closed");
     }
 
@@ -203,6 +212,8 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    // place our own cursor on the seam monitor we returned from
+                    EmulationRequest::LocalWarp(side) => self.emulation_proxy.local_warp(side),
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -243,6 +254,9 @@ enum ProxyRequest {
     Input(Event, SocketAddr),
     /// warp the cursor of the given incoming connection to its seam side
     Position(SocketAddr, PointerSide),
+    /// warp this host's own cursor to the seam side when it resumes local
+    /// control after having driven a remote client.
+    LocalWarp(PointerSide),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -260,6 +274,7 @@ impl EmulationProxy {
             request_rx,
             event_tx,
             handles: Default::default(),
+            local_handle: None,
             next_id: 0,
         };
         let task = spawn_local(emulation_task.run());
@@ -304,6 +319,16 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    /// Warp this host's own cursor to the given seam side (used when local
+    /// control resumes after driving a remote client).
+    fn local_warp(&self, side: PointerSide) {
+        if self.emulation_active.get() {
+            self.request_tx
+                .send(ProxyRequest::LocalWarp(side))
+                .expect("channel closed");
+        }
+    }
+
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
@@ -325,6 +350,8 @@ struct EmulationTask {
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
+    /// Reserved handle used to move this host's own cursor (local warp).
+    local_handle: Option<EmulationHandle>,
     next_id: EmulationHandle,
 }
 
@@ -344,6 +371,7 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Position(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::LocalWarp(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -381,9 +409,16 @@ impl EmulationTask {
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
-        for handle in self.handles.values() {
+        // Recreate the reserved local-warp handle too, otherwise a restart of
+        // the emulation session would leave it without a backend pointer and
+        // `LocalWarp` would silently no-op.
+        let mut handles: Vec<EmulationHandle> = self.handles.values().copied().collect();
+        if let Some(local) = self.local_handle {
+            handles.push(local);
+        }
+        for handle in handles {
             tokio::select! {
-                _ = emulation.create(*handle) => {},
+                _ = emulation.create(handle) => {},
                 _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
             }
         }
@@ -418,6 +453,19 @@ impl EmulationTask {
                                 self.next_id += 1;
                                 emulation.create(handle).await;
                                 self.handles.insert(addr, handle);
+                                handle
+                            }
+                        };
+                        emulation.warp_to_edge(handle, side).await?;
+                    },
+                    ProxyRequest::LocalWarp(side) => {
+                        let handle = match self.local_handle {
+                            Some(handle) => handle,
+                            None => {
+                                let handle = self.next_id;
+                                self.next_id += 1;
+                                emulation.create(handle).await;
+                                self.local_handle = Some(handle);
                                 handle
                             }
                         };
@@ -460,6 +508,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Position(_, _) => continue,
+            ProxyRequest::LocalWarp(..) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }
