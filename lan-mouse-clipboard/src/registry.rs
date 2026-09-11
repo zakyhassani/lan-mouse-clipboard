@@ -73,6 +73,31 @@ impl ConnectionRegistry {
         self.peers.keys().copied().collect()
     }
 
+    /// All live connections with their kind, for reconciliation/pruning.
+    pub fn entries(&self) -> Vec<(SocketAddr, ConnKind)> {
+        self.peers.iter().map(|(addr, e)| (*addr, e.kind)).collect()
+    }
+
+    /// Write a frame to a single connection (used for control frames such as
+    /// pings/pongs). Returns `false` and removes the connection if the write
+    /// fails.
+    pub async fn write_to(&mut self, addr: &SocketAddr, frame: &[u8]) -> bool {
+        let Some(entry) = self.peers.get_mut(addr) else {
+            return false;
+        };
+        match entry.sink.write_all(frame).await {
+            Ok(()) => {
+                entry.last_used = Instant::now();
+                true
+            }
+            Err(e) => {
+                log::warn!("clipboard control write to {addr} failed: {e}");
+                self.peers.remove(addr);
+                false
+            }
+        }
+    }
+
     /// Broadcast an encoded frame to every live connection.
     ///
     /// Connections that fail to accept the write are removed. Returns the

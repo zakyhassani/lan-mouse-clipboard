@@ -37,6 +37,10 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    /// Local control resumed after driving a remote client. Carries the side
+    /// the remote client sits on so the local cursor can be warped to that
+    /// seam monitor instead of resuming wherever it last was.
+    Released(input_emulation::PointerSide),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +179,11 @@ impl CaptureTask {
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
+        // If the active client's capture is gone, it can no longer be the
+        // active client; otherwise a later release would look up a dead handle.
+        if self.active_client == Some(handle) {
+            self.active_client = None;
+        }
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
@@ -189,6 +198,16 @@ impl CaptureTask {
             .find(|(h, ..)| *h == handle)
             .expect("no such capture")
             .1
+    }
+
+    /// Like [`Self::get_pos`] but returns `None` instead of panicking when the
+    /// handle has no live capture (e.g. it was destroyed by a config change or
+    /// client deactivation while it was still the active client).
+    fn get_pos_opt(&self, handle: CaptureHandle) -> Option<Position> {
+        self.captures
+            .iter()
+            .find(|(h, ..)| *h == handle)
+            .map(|entry| entry.1)
     }
 
     fn get_type(&self, handle: CaptureHandle) -> CaptureType {
@@ -375,7 +394,8 @@ impl CaptureTask {
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         // If we have an active client, notify them we're leaving
-        if let Some(handle) = self.active_client.take() {
+        let released_side = if let Some(handle) = self.active_client.take() {
+            let side = self.get_pos_opt(handle).map(to_pointer_side);
             // Synthesize key-up events for every key still held in the
             // capture's pressed_keys set BEFORE sending Leave. Without
             // this, pressing the release-bind chord (typically all four
@@ -415,8 +435,18 @@ impl CaptureTask {
             if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
+            side
+        } else {
+            None
+        };
+        capture.release().await?;
+        // Local control just resumed. Tell the service to place our cursor on
+        // the seam monitor the remote client sat on, instead of leaving it
+        // wherever it last was (purely relative emulation never moves it).
+        if let Some(side) = released_side {
+            let _ = self.event_tx.send(ICaptureEvent::Released(side));
         }
-        capture.release().await
+        Ok(())
     }
 }
 
@@ -437,6 +467,15 @@ fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
         lan_mouse_ipc::Position::Right => input_capture::Position::Right,
         lan_mouse_ipc::Position::Top => input_capture::Position::Top,
         lan_mouse_ipc::Position::Bottom => input_capture::Position::Bottom,
+    }
+}
+
+fn to_pointer_side(pos: input_capture::Position) -> input_emulation::PointerSide {
+    match pos {
+        input_capture::Position::Left => input_emulation::PointerSide::Left,
+        input_capture::Position::Right => input_emulation::PointerSide::Right,
+        input_capture::Position::Top => input_emulation::PointerSide::Top,
+        input_capture::Position::Bottom => input_emulation::PointerSide::Bottom,
     }
 }
 

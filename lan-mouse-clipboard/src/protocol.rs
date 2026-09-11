@@ -7,6 +7,10 @@
 use crate::item::{ClipboardItem, DEFAULT_MAX_ITEM_SIZE};
 
 pub const KIND_ANNOUNCE: u8 = 1;
+/// Liveness probe sent periodically by the network task.
+pub const KIND_PING: u8 = 2;
+/// Reply to a [`KIND_PING`]; proves the peer's read path is alive.
+pub const KIND_PONG: u8 = 3;
 
 /// Upper bound for a decoded payload. Guards against a misbehaving peer
 /// allocating huge buffers; the effective cap is the item size limit.
@@ -16,6 +20,10 @@ pub const MAX_PAYLOAD_SIZE: usize = DEFAULT_MAX_ITEM_SIZE + 64;
 pub enum Message {
     /// Share one clipboard item with a peer.
     Announce(ClipboardItem),
+    /// Liveness probe (health check).
+    Ping,
+    /// Liveness reply to a [`Message::Ping`].
+    Pong,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +43,8 @@ impl Message {
     pub fn encode(&self, max_item_size: usize) -> Result<Vec<u8>, ProtocolError> {
         let payload = match self {
             Message::Announce(item) => encode_announce(item, max_item_size)?,
+            Message::Ping => vec![KIND_PING],
+            Message::Pong => vec![KIND_PONG],
         };
         if payload.len() > MAX_PAYLOAD_SIZE {
             return Err(ProtocolError::PayloadTooLarge(
@@ -55,6 +65,20 @@ impl Message {
             .ok_or_else(|| ProtocolError::Invalid("empty payload".into()))?;
         match kind {
             KIND_ANNOUNCE => decode_announce(rest).map(Message::Announce),
+            KIND_PING => {
+                if rest.is_empty() {
+                    Ok(Message::Ping)
+                } else {
+                    Err(ProtocolError::Invalid("ping with trailing bytes".into()))
+                }
+            }
+            KIND_PONG => {
+                if rest.is_empty() {
+                    Ok(Message::Pong)
+                } else {
+                    Err(ProtocolError::Invalid("pong with trailing bytes".into()))
+                }
+            }
             _ => Err(ProtocolError::UnknownKind(kind)),
         }
     }
@@ -230,6 +254,14 @@ mod tests {
         let payload = &frame[4..];
         let decoded = Message::decode(payload).unwrap();
         assert_eq!(decoded, Message::Announce(item));
+    }
+
+    #[test]
+    fn ping_pong_roundtrip() {
+        for msg in [Message::Ping, Message::Pong] {
+            let frame = msg.encode(1024).unwrap();
+            assert_eq!(Message::decode(&frame[4..]).unwrap(), msg);
+        }
     }
 
     #[test]
