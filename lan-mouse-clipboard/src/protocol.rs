@@ -12,9 +12,19 @@ pub const KIND_PING: u8 = 2;
 /// Reply to a [`KIND_PING`]; proves the peer's read path is alive.
 pub const KIND_PONG: u8 = 3;
 
-/// Upper bound for a decoded payload. Guards against a misbehaving peer
-/// allocating huge buffers; the effective cap is the item size limit.
-pub const MAX_PAYLOAD_SIZE: usize = DEFAULT_MAX_ITEM_SIZE + 64;
+/// Overhead margin allowed on top of the item size cap when framing. Covers
+/// the kind/origin/serial/count header plus the per-representation length
+/// prefixes, so a legitimate item at exactly the cap still fits its frame.
+pub const FRAME_OVERHEAD_MARGIN: usize = 64 * 1024;
+
+/// Upper bound for a decoded payload given the configured item size cap.
+/// Guards against a misbehaving peer allocating huge buffers.
+pub fn max_payload_size(max_item_size: usize) -> usize {
+    max_item_size.saturating_add(FRAME_OVERHEAD_MARGIN)
+}
+
+/// Upper bound for a decoded payload using the default item size cap.
+pub const MAX_PAYLOAD_SIZE: usize = DEFAULT_MAX_ITEM_SIZE + FRAME_OVERHEAD_MARGIN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -46,11 +56,9 @@ impl Message {
             Message::Ping => vec![KIND_PING],
             Message::Pong => vec![KIND_PONG],
         };
-        if payload.len() > MAX_PAYLOAD_SIZE {
-            return Err(ProtocolError::PayloadTooLarge(
-                payload.len(),
-                MAX_PAYLOAD_SIZE,
-            ));
+        let cap = max_payload_size(max_item_size);
+        if payload.len() > cap {
+            return Err(ProtocolError::PayloadTooLarge(payload.len(), cap));
         }
         let mut frame = Vec::with_capacity(4 + payload.len());
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -194,15 +202,32 @@ impl<'a> Cursor<'a> {
 ///
 /// Feeds the length-prefixed envelope `[len: u32 BE][payload]` and yields
 /// each payload as soon as its full frame is available.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FrameReader {
     /// Bytes received but not yet consumed into a full frame.
     buf: Vec<u8>,
+    /// Maximum accepted payload length for a single frame.
+    max_payload: usize,
+}
+
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FrameReader {
+    /// Reader using the default item size cap.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_payload(MAX_PAYLOAD_SIZE)
+    }
+
+    /// Reader that accepts payloads up to `max_payload` bytes.
+    pub fn with_max_payload(max_payload: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max_payload,
+        }
     }
 
     /// Push freshly-read bytes onto the accumulator.
@@ -216,8 +241,8 @@ impl FrameReader {
             return Ok(None);
         }
         let len = u32::from_be_bytes(self.buf[..4].try_into().unwrap()) as usize;
-        if len > MAX_PAYLOAD_SIZE {
-            return Err(ProtocolError::PayloadTooLarge(len, MAX_PAYLOAD_SIZE));
+        if len > self.max_payload {
+            return Err(ProtocolError::PayloadTooLarge(len, self.max_payload));
         }
         let total = 4 + len;
         if self.buf.len() < total {
@@ -477,5 +502,64 @@ mod tests {
             reader.next_frame(),
             Err(ProtocolError::PayloadTooLarge(_, _))
         ));
+    }
+
+    #[test]
+    fn frame_reader_honours_custom_payload_cap() {
+        let mut reader = FrameReader::with_max_payload(1024);
+        // A length prefix claiming 2 KiB is over the custom cap.
+        reader.push(&2048u32.to_be_bytes());
+        assert!(matches!(
+            reader.next_frame(),
+            Err(ProtocolError::PayloadTooLarge(2048, 1024))
+        ));
+        // The default reader accepts the same length.
+        let mut dflt = FrameReader::new();
+        dflt.push(&2048u32.to_be_bytes());
+        assert!(dflt.next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn multi_rep_image_item_roundtrips() {
+        let item = ClipboardItem {
+            origin: [7; 8],
+            serial: 3,
+            reps: vec![
+                (
+                    "image/png".into(),
+                    vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x0a],
+                ),
+                ("text/html".into(), b"<img src=\"data:...\">".to_vec()),
+                ("text/plain".into(), b"alt text".to_vec()),
+            ],
+        };
+        let frame = Message::Announce(item.clone())
+            .encode(1024 * 1024)
+            .expect("encode");
+        let decoded = Message::decode(&frame[4..]).expect("decode");
+        assert_eq!(decoded, Message::Announce(item));
+    }
+
+    #[test]
+    fn encode_scales_with_the_configured_cap() {
+        let item = ClipboardItem {
+            origin: [0; 8],
+            serial: 0,
+            reps: vec![("image/png".into(), vec![0xAB; 8 * 1024])],
+        };
+        assert!(matches!(
+            Message::Announce(item.clone()).encode(4 * 1024),
+            Err(ProtocolError::TooLarge(_, 4096))
+        ));
+        assert!(Message::Announce(item).encode(16 * 1024).is_ok());
+    }
+
+    #[test]
+    fn max_payload_size_tracks_the_item_cap() {
+        assert_eq!(max_payload_size(0), FRAME_OVERHEAD_MARGIN);
+        assert_eq!(
+            max_payload_size(DEFAULT_MAX_ITEM_SIZE),
+            DEFAULT_MAX_ITEM_SIZE + FRAME_OVERHEAD_MARGIN
+        );
     }
 }

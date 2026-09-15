@@ -1,6 +1,11 @@
 //! Loop prevention: origin checks, serials, and content-hash dedup.
 
-use crate::item::{ClipboardItem, origin_from_fingerprint};
+use std::collections::VecDeque;
+
+use crate::item::{ClipboardItem, origin_from_fingerprint, rep_hash};
+
+/// How many recently-sent representation hashes to remember.
+const SENT_HISTORY: usize = 128;
 
 /// Tracks per-machine origin identity and decides, for each clipboard
 /// item, whether it should be applied (remote) or broadcast (local).
@@ -11,13 +16,19 @@ use crate::item::{ClipboardItem, origin_from_fingerprint};
 ///   are dropped (dedup), so two machines copying identical content do not
 ///   ping-pong forever;
 /// - applying a remote item arms an "echo suppress": the local backend's
-///   change notification for that exact content is not re-broadcast.
+///   change notification for that exact content is not re-broadcast;
+/// - every representation of a locally-sent item is remembered, so a peer
+///   that can only preserve the primary rep (an older build, or a backend
+///   that advertises one MIME type) cannot bounce a secondary rep back as
+///   "new" content.
 pub struct LoopPrevention {
     self_origin: [u8; 8],
     serial: u64,
     last_local_hash: Option<[u8; 32]>,
     last_remote_hash: Option<[u8; 32]>,
     pending_suppress: Option<[u8; 32]>,
+    /// Hashes of every rep of recently-sent items, oldest first.
+    sent_rep_hashes: VecDeque<[u8; 32]>,
 }
 
 impl LoopPrevention {
@@ -28,6 +39,7 @@ impl LoopPrevention {
             last_local_hash: None,
             last_remote_hash: None,
             pending_suppress: None,
+            sent_rep_hashes: VecDeque::new(),
         }
     }
 
@@ -64,6 +76,12 @@ impl LoopPrevention {
         if Some(hash) == self.last_remote_hash || Some(hash) == self.last_local_hash {
             return false;
         }
+        // A peer that can only preserve the primary rep echoes a secondary
+        // rep back as a single-rep item whose primary hash is one of the reps
+        // we sent. Recognize it as an echo instead of applying it.
+        if self.sent_rep_hashes.contains(&hash) {
+            return false;
+        }
         self.last_remote_hash = Some(hash);
         self.pending_suppress = Some(hash);
         true
@@ -93,6 +111,19 @@ impl LoopPrevention {
     /// Record that we broadcast a locally-originated item (tracks its hash
     /// for dedup against future remote echoes).
     pub fn note_broadcast(&mut self, item: &ClipboardItem) {
+        self.note_sent(item);
+    }
+
+    /// Record every representation of an item we just broadcast, so a peer
+    /// echoing back a representation it could reproduce (typically the primary)
+    /// is recognized and suppressed.
+    pub fn note_sent(&mut self, item: &ClipboardItem) {
+        for (mime, data) in &item.reps {
+            self.sent_rep_hashes.push_back(rep_hash(mime, data));
+        }
+        while self.sent_rep_hashes.len() > SENT_HISTORY {
+            self.sent_rep_hashes.pop_front();
+        }
         self.last_local_hash = Some(item.content_hash());
     }
 }
@@ -152,6 +183,54 @@ mod tests {
         // peer echoes the same content back
         let echo = remote_item(B, "mine", 1);
         assert!(!lp.should_apply_remote(&echo));
+    }
+
+    #[test]
+    fn secondary_rep_echoed_by_a_legacy_peer_is_suppressed() {
+        let mut lp = LoopPrevention::new(A);
+        let sent = ClipboardItem {
+            origin: A,
+            serial: 1,
+            reps: vec![
+                ("image/png".into(), vec![1, 2, 3]),
+                ("text/plain".into(), b"alt".to_vec()),
+            ],
+        };
+        assert!(lp.on_local_change(&sent));
+        lp.note_sent(&sent);
+
+        // A peer that cannot reproduce the primary rep (an older build) can
+        // echo a secondary rep back as a single-rep item.
+        let echo = ClipboardItem {
+            origin: B,
+            serial: 7,
+            reps: vec![("text/plain".into(), b"alt".to_vec())],
+        };
+        assert!(
+            !lp.should_apply_remote(&echo),
+            "secondary-rep echo must be suppressed"
+        );
+    }
+
+    #[test]
+    fn sent_history_is_bounded() {
+        let mut lp = LoopPrevention::new(A);
+        for i in 0..(SENT_HISTORY as u64 * 4) {
+            lp.note_sent(&ClipboardItem {
+                origin: A,
+                serial: i,
+                reps: vec![("application/x-test".into(), i.to_be_bytes().to_vec())],
+            });
+        }
+        let ancient = ClipboardItem {
+            origin: B,
+            serial: 1,
+            reps: vec![("application/x-test".into(), 0u64.to_be_bytes().to_vec())],
+        };
+        assert!(
+            lp.should_apply_remote(&ancient),
+            "hash evicted from the sent history is treated as new"
+        );
     }
 
     #[test]

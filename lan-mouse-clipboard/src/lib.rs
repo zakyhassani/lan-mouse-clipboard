@@ -15,7 +15,7 @@ pub mod registry;
 pub mod transport;
 
 pub use backend::BackendKind;
-pub use item::{ClipboardItem, DEFAULT_MAX_ITEM_SIZE};
+pub use item::{ClipboardItem, DEFAULT_MAX_ITEM_SIZE, MAX_ITEM_SIZE_LIMIT};
 
 use std::pin::Pin;
 
@@ -68,10 +68,12 @@ impl Clipboard {
     /// Create the clipboard subsystem, spawning its driver task.
     ///
     /// `inbound_rx` receives frames from the network task; `broadcast_tx`
-    /// carries broadcast frames to the network task.
+    /// carries broadcast frames to the network task. `max_item_size` is the
+    /// total size cap for a single item (all representations combined).
     pub fn new(
         enabled: bool,
         backend: BackendKind,
+        max_item_size: usize,
         origin: [u8; 8],
         inbound_rx: mpsc::Receiver<Vec<u8>>,
         broadcast_tx: mpsc::Sender<Vec<u8>>,
@@ -81,8 +83,8 @@ impl Clipboard {
         let inner = ClipboardInner {
             enabled,
             origin,
-            max_item_size: DEFAULT_MAX_ITEM_SIZE,
-            backends: build_backends(backend),
+            max_item_size,
+            backends: build_backends(backend, max_item_size),
             loop_prevention: LoopPrevention::new(origin),
             watcher: None,
         };
@@ -152,6 +154,10 @@ async fn run_clipboard(
                 item.origin = inner.origin;
                 item.serial = inner.loop_prevention.next_serial();
                 if inner.loop_prevention.on_local_change(&item) {
+                    // Remember every rep we are about to send so a peer that
+                    // can only reproduce the primary rep cannot bounce a
+                    // secondary rep back as new content.
+                    inner.loop_prevention.note_sent(&item);
                     match Message::Announce(item).encode(inner.max_item_size) {
                         Ok(frame) => {
                             if broadcast_tx.send(frame).await.is_err() { break; }
@@ -218,6 +224,7 @@ mod tests {
         let mut clip = Clipboard::new(
             false,
             BackendKind::Dummy,
+            DEFAULT_MAX_ITEM_SIZE,
             [0xAA; 8],
             inbound_rx,
             broadcast_tx,
@@ -235,6 +242,7 @@ mod tests {
         let _clip = Clipboard::new(
             true,
             BackendKind::Dummy,
+            DEFAULT_MAX_ITEM_SIZE,
             [0xAA; 8],
             inbound_rx,
             broadcast_tx,
@@ -390,10 +398,115 @@ mod tests {
         }
     }
 
+    fn multi_rep_image_item() -> ClipboardItem {
+        ClipboardItem {
+            origin: [0; 8],
+            serial: 0,
+            reps: vec![
+                (
+                    "image/png".into(),
+                    vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x0a],
+                ),
+                ("text/html".into(), b"<img>".to_vec()),
+                ("text/plain".into(), b"alt".to_vec()),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn local_image_item_is_broadcast_with_all_reps() {
+        let mut drv = spawn_driver(true, [0xAA; 8]);
+        drv.stub
+            .watch_tx
+            .send(ClipboardChange::New(multi_rep_image_item()))
+            .await
+            .unwrap();
+
+        let frame = drv.broadcast_rx.recv().await.unwrap();
+        match Message::decode(&frame[4..]).unwrap() {
+            Message::Announce(item) => {
+                assert_eq!(item.origin, [0xAA; 8]);
+                assert!(item.serial >= 1);
+                assert!(item.primary_is_image());
+                assert_eq!(item.reps.len(), 3, "all offered reps travel");
+            }
+            other => panic!("expected Announce, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_remote_apply_then_primary_only_echo_is_suppressed() {
+        let mut drv = spawn_driver(true, [0xAA; 8]);
+
+        let mut remote = multi_rep_image_item();
+        remote.origin = [0xBB; 8];
+        remote.serial = 1;
+        let frame = Message::Announce(remote.clone()).encode(1024).unwrap();
+        drv.inbound_tx.send(frame[4..].to_vec()).await.unwrap();
+
+        wait_until(|| drv.stub.set_count() >= 1).await;
+        let applied = drv.stub.last_set().expect("applied");
+        assert_eq!(applied.reps.len(), 3);
+
+        // The receiver can only advertise the primary rep, so its echo is the
+        // primary rep alone. That must still be recognized as an echo.
+        let echo = ClipboardItem {
+            origin: [0; 8],
+            serial: 0,
+            reps: vec![remote.reps[0].clone()],
+        };
+        drv.stub
+            .watch_tx
+            .send(ClipboardChange::New(echo))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            drv.broadcast_rx.try_recv().is_err(),
+            "primary-only echo of a multi-rep remote item must be suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_echo_of_a_secondary_rep_is_ignored() {
+        let mut drv = spawn_driver(true, [0xAA; 8]);
+        // We copy a multi-rep image and broadcast it.
+        drv.stub
+            .watch_tx
+            .send(ClipboardChange::New(multi_rep_image_item()))
+            .await
+            .unwrap();
+        let frame = drv.broadcast_rx.recv().await.unwrap();
+        assert!(matches!(
+            Message::decode(&frame[4..]).unwrap(),
+            Message::Announce(_)
+        ));
+
+        // A peer that only preserved a secondary rep echoes it back as a
+        // single-rep item. It must not be applied or re-broadcast.
+        let echo = ClipboardItem {
+            origin: [0xBB; 8],
+            serial: 9,
+            reps: vec![("text/plain".into(), b"alt".to_vec())],
+        };
+        let frame = Message::Announce(echo).encode(1024).unwrap();
+        drv.inbound_tx.send(frame[4..].to_vec()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            drv.stub.set_count(),
+            0,
+            "a secondary-rep echo must not be applied"
+        );
+        assert!(
+            drv.broadcast_rx.try_recv().is_err(),
+            "a secondary-rep echo must not be re-broadcast"
+        );
+    }
+
     #[tokio::test]
     async fn remote_change_is_applied_and_echo_is_suppressed() {
         let mut drv = spawn_driver(true, [0xAA; 8]);
-
         let remote = ClipboardItem::text("hi", [0xBB; 8], 1);
         let frame = Message::Announce(remote).encode(1024).unwrap();
         drv.inbound_tx.send(frame[4..].to_vec()).await.unwrap();
@@ -499,6 +612,7 @@ mod tests {
         let mut clip = Clipboard::new(
             false,
             BackendKind::Dummy,
+            DEFAULT_MAX_ITEM_SIZE,
             [0xAA; 8],
             inbound_rx,
             broadcast_tx,

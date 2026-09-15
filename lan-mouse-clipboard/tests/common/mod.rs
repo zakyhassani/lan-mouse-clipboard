@@ -30,6 +30,7 @@ pub struct StubEnv {
     pub clip_file: PathBuf,
     pub cliphist_file: PathBuf,
     pub dbus_file: PathBuf,
+    pub types_file: PathBuf,
     _old_path: Option<String>,
 }
 
@@ -53,25 +54,43 @@ impl StubEnv {
         let clip_file = dir.join("clip.txt");
         let cliphist_file = dir.join("cliphist.txt");
         let dbus_file = dir.join("dbus.txt");
+        let types_file = dir.join("types.txt");
 
         // State files used by the stub scripts, pre-created empty.
         fs::write(&clip_file, b"").expect("clip file");
         fs::write(&cliphist_file, b"").expect("cliphist file");
         fs::write(&dbus_file, b"").expect("dbus file");
+        fs::write(&types_file, b"").expect("types file");
 
         let old_path = std::env::var_os("PATH").map(|v| v.to_string_lossy().into_owned());
         std::env::set_var("PATH", &dir);
         std::env::set_var("STUB_CLIP_FILE", &clip_file);
         std::env::set_var("STUB_CLIPHIST_FILE", &cliphist_file);
         std::env::set_var("STUB_DBUS_FILE", &dbus_file);
+        std::env::set_var("STUB_TYPES_FILE", &types_file);
 
         Self {
             dir,
             clip_file,
             cliphist_file,
             dbus_file,
+            types_file,
             _old_path: old_path,
         }
+    }
+
+    /// Simulate a selection offering `types`, with `data` as the bytes every
+    /// type resolves to (a real selection can differ per type; the stubs model
+    /// the common case where they share content).
+    pub fn set_selection(&self, types: &[&str], data: &[u8]) {
+        self.write_types(types);
+        fs::write(&self.clip_file, data).expect("clip write");
+    }
+
+    /// Simulate the selection's advertised type list.
+    pub fn write_types(&self, types: &[&str]) {
+        let body = types.join("\n");
+        fs::write(&self.types_file, body).expect("types write");
     }
 
     /// Read the contents a stub wrote to the simulated clipboard.
@@ -96,6 +115,7 @@ impl Drop for StubEnv {
         std::env::remove_var("STUB_CLIP_FILE");
         std::env::remove_var("STUB_CLIPHIST_FILE");
         std::env::remove_var("STUB_DBUS_FILE");
+        std::env::remove_var("STUB_TYPES_FILE");
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -109,21 +129,49 @@ fn fresh_suffix() -> String {
     format!("{nanos:?}")
 }
 
-/// A `wl-paste` stub. Ignores arguments for read; writes through to the
-/// shared simulated clipboard file. Exit code 1 when there is no content.
+/// A `wl-paste` stub. Emulates `--list-types` from `$STUB_TYPES_FILE` and
+/// `--type <mime>` from the shared simulated clipboard file. Exit code 1 when
+/// there is no content, or when the requested type is not offered.
 pub const WL_PASTE_STUB: &str = r#"#!/bin/sh
 export PATH="/usr/bin:/bin"
 case "$*" in
-  *"--watch"*) cat "$STUB_CLIP_FILE"; exit 0;;
+  *"--watch"*) echo change; exit 0;;
 esac
+case "$*" in
+  *"--list-types"*)
+    if [ ! -s "$STUB_TYPES_FILE" ]; then exit 1; fi
+    cat "$STUB_TYPES_FILE"
+    exit 0;;
+esac
+mime=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--type" ] || [ "$prev" = "-t" ]; then mime="$a"; fi
+  prev="$a"
+done
+if [ ! -s "$STUB_TYPES_FILE" ]; then exit 1; fi
+if [ -n "$mime" ] && ! grep -Fxq "$mime" "$STUB_TYPES_FILE"; then exit 1; fi
 if [ ! -s "$STUB_CLIP_FILE" ]; then exit 1; fi
 cat "$STUB_CLIP_FILE"
 "#;
 
-/// A `wl-copy` stub that stores stdin into the simulated clipboard file.
+/// A `wl-copy` stub that stores stdin into the simulated clipboard file and
+/// records the advertised MIME type (`--type <mime>`) as the offered list.
 pub const WL_COPY_STUB: &str = r#"#!/bin/sh
 export PATH="/usr/bin:/bin"
+mime=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--type" ] || [ "$prev" = "-t" ]; then mime="$a"; fi
+  prev="$a"
+done
 cat > "$STUB_CLIP_FILE"
+if [ -n "$mime" ]; then
+  printf '%s\n' "$mime" > "$STUB_TYPES_FILE"
+else
+  : > "$STUB_TYPES_FILE"
+fi
+exit 0
 "#;
 
 /// A `cliphist` stub that records `store --mime <mime>` stdin.

@@ -43,13 +43,24 @@ impl ClipboardBackend for ClipHistBackend {
     }
 
     async fn set(&self, item: &ClipboardItem) -> Result<(), BackendError> {
-        let Some((mime, data)) = item.reps.first() else {
+        let Some((mime, data)) = item.primary() else {
+            return Ok(());
+        };
+        // cliphist stores by MIME type; the legacy X11 text aliases are not
+        // MIME types, so normalize them to plain text (and skip anything else
+        // that is not a MIME type).
+        let mime = if mime.contains('/') {
+            mime.clone()
+        } else if crate::item::is_text_mime(mime) {
+            crate::item::MIME_TEXT_PLAIN.to_string()
+        } else {
+            log::debug!("cliphist: skipping non-MIME representation {mime}");
             return Ok(());
         };
         let mut child = Command::new("cliphist")
             .arg("store")
             .arg("--mime")
-            .arg(mime)
+            .arg(&mime)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

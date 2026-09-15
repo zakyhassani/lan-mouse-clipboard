@@ -32,7 +32,7 @@ async fn wl_clipboard_set_then_read_roundtrips() {
         ("wl-copy", WL_COPY_STUB),
         ("dbus-send", DBUS_SEND_STUB),
     ]);
-    let backend = WlClipboardBackend::new();
+    let backend = WlClipboardBackend::new(64 * 1024 * 1024);
 
     // Empty clipboard -> None.
     assert!(backend.read_current().await.is_none());
@@ -44,16 +44,70 @@ async fn wl_clipboard_set_then_read_roundtrips() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // PATH lock must span the whole test
-async fn wl_clipboard_set_without_text_rep_errors() {
+async fn wl_clipboard_empty_item_errors() {
     let _guard = path_lock();
     let _env = StubEnv::new(&[("wl-copy", WL_COPY_STUB)]);
-    let backend = WlClipboardBackend::new();
+    let backend = WlClipboardBackend::new(64 * 1024 * 1024);
     let item = ClipboardItem {
         origin: [0; 8],
         serial: 0,
-        reps: vec![("image/png".into(), vec![1, 2, 3])],
+        reps: vec![],
     };
     assert!(backend.set(&item).await.is_err());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // PATH lock must span the whole test
+async fn wl_clipboard_roundtrips_an_image_primary_rep() {
+    let _guard = path_lock();
+    let env = StubEnv::new(&[("wl-paste", WL_PASTE_STUB), ("wl-copy", WL_COPY_STUB)]);
+    let backend = WlClipboardBackend::new(64 * 1024 * 1024);
+    let png = vec![
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x0a, 0xff,
+    ];
+    let item = ClipboardItem {
+        origin: [0; 8],
+        serial: 0,
+        reps: vec![
+            ("image/png".into(), png.clone()),
+            ("text/html".into(), b"<img>".to_vec()),
+        ],
+    };
+    backend.set(&item).await.expect("set image");
+    // wl-copy advertises exactly the primary type.
+    assert_eq!(env.read_clip(), png);
+
+    let read = backend.read_current().await.expect("read back");
+    assert_eq!(read.primary_mime(), Some("image/png"));
+    assert_eq!(
+        read.primary().map(|(_, d)| d.as_slice()),
+        Some(png.as_slice())
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // PATH lock must span the whole test
+async fn wl_clipboard_reads_all_offered_mime_reps_in_order() {
+    let _guard = path_lock();
+    let env = StubEnv::new(&[("wl-paste", WL_PASTE_STUB), ("wl-copy", WL_COPY_STUB)]);
+    let backend = WlClipboardBackend::new(64 * 1024 * 1024);
+    // A browser-style image copy: text/html is offered first.
+    env.set_selection(
+        &[
+            "text/html",
+            "image/png",
+            "text/plain",
+            "TARGETS",
+            "MULTIPLE",
+            "UTF8_STRING",
+        ],
+        b"shared payload",
+    );
+    let item = backend.read_current().await.expect("read");
+    let mimes: Vec<&str> = item.reps.iter().map(|(m, _)| m.as_str()).collect();
+    // Protocol targets and the X11 aliases are filtered; order is preserved.
+    assert_eq!(mimes, vec!["text/html", "image/png", "text/plain"]);
+    assert_eq!(item.primary_mime(), Some("text/html"));
 }
 
 #[tokio::test]
@@ -100,7 +154,8 @@ async fn auto_backend_falls_back_to_dummy_when_no_tools() {
     let _guard = path_lock();
     // No stubs -> PATH contains nothing -> no external tool is available.
     let _env = StubEnv::new(&[]);
-    let backends = lan_mouse_clipboard::backend::build_backends(BackendKind::Auto);
+    let backends =
+        lan_mouse_clipboard::backend::build_backends(BackendKind::Auto, 64 * 1024 * 1024);
     assert!(!backends.is_empty());
     assert_eq!(backends[0].name(), DummyBackend::new().name());
 }
@@ -123,7 +178,7 @@ fn dummy_is_always_available() {
 async fn wl_clipboard_random_text_roundtrips() {
     let _guard = path_lock();
     let _env = StubEnv::new(&[("wl-paste", WL_PASTE_STUB), ("wl-copy", WL_COPY_STUB)]);
-    let backend = WlClipboardBackend::new();
+    let backend = WlClipboardBackend::new(64 * 1024 * 1024);
     let mut rng = Rng::new(0xCAFE);
     for _ in 0..50 {
         // Random-length, random-byte text payload (lossily valid UTF-8 so the
