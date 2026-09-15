@@ -2,13 +2,59 @@
 
 use sha2::{Digest, Sha256};
 
-/// Maximum total clipboard item size (all representations combined).
+/// Default maximum total clipboard item size (all representations combined).
 pub const DEFAULT_MAX_ITEM_SIZE: usize = 64 * 1024 * 1024;
+
+/// Hard ceiling for the configured item size cap. Guards against a
+/// misconfigured or hostile config value causing unbounded allocations.
+pub const MAX_ITEM_SIZE_LIMIT: usize = 256 * 1024 * 1024;
 
 /// Preferred MIME type for plain text.
 pub const MIME_TEXT_PLAIN: &str = "text/plain;charset=utf-8";
 /// Common alias for plain text without a charset parameter.
 pub const MIME_TEXT_PLAIN_ALT: &str = "text/plain";
+
+/// MIME type for PNG images (the common clipboard image format).
+pub const MIME_IMAGE_PNG: &str = "image/png";
+
+/// Legacy X11 string targets. They carry text but are not MIME types, so they
+/// are only transferable as a fallback when a selection offers no MIME type.
+pub const X11_TEXT_TARGETS: &[&str] = &["UTF8_STRING", "STRING", "TEXT"];
+
+/// Whether a MIME type carries UTF-8 text that may be newline-normalized.
+///
+/// Text MIME types (`text/*`) plus the legacy X11 string targets are treated
+/// as text; everything else is passed through as raw binary. The X11 target
+/// match is case-insensitive.
+pub fn is_text_mime(mime: &str) -> bool {
+    mime.to_ascii_lowercase().starts_with("text/")
+        || X11_TEXT_TARGETS
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(mime))
+}
+
+/// Whether a MIME type carries an image.
+pub fn is_image_mime(mime: &str) -> bool {
+    mime.to_ascii_lowercase().starts_with("image/")
+}
+
+/// Size of one representation in bytes (MIME type plus data).
+///
+/// The single accounting rule for item size, shared by `total_size` and the
+/// reading backends so the read-side and encode-side caps cannot diverge.
+pub fn rep_size(mime: &str, data: &[u8]) -> usize {
+    mime.len() + data.len()
+}
+
+/// Stable hash of a single representation.
+pub fn rep_hash(mime: &str, data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(mime.as_bytes());
+    hasher.update([0]);
+    hasher.update(data);
+    hasher.update([0]);
+    hasher.finalize().into()
+}
 
 /// A clipboard item with one or more MIME representations.
 ///
@@ -37,7 +83,28 @@ impl ClipboardItem {
 
     /// Total size in bytes of all representations (does not include overhead).
     pub fn total_size(&self) -> usize {
-        self.reps.iter().map(|(m, d)| m.len() + d.len()).sum()
+        self.reps.iter().map(|(m, d)| rep_size(m, d)).sum()
+    }
+
+    /// The primary representation: the one receivers apply when they can only
+    /// advertise a single MIME type (sender-preferred, so first).
+    pub fn primary(&self) -> Option<&(String, Vec<u8>)> {
+        self.reps.first()
+    }
+
+    /// MIME type of the primary representation, if any.
+    pub fn primary_mime(&self) -> Option<&str> {
+        self.reps.first().map(|(m, _)| m.as_str())
+    }
+
+    /// Whether the primary representation is plain text.
+    pub fn primary_is_text(&self) -> bool {
+        self.primary_mime().is_some_and(is_text_mime)
+    }
+
+    /// Whether the primary representation is an image.
+    pub fn primary_is_image(&self) -> bool {
+        self.primary_mime().is_some_and(is_image_mime)
     }
 
     /// Best-effort UTF-8 text extraction, preferring the plain-text MIME types.
@@ -51,19 +118,20 @@ impl ClipboardItem {
         None
     }
 
-    /// Stable content hash over every (mime, data) pair.
+    /// Stable content hash over the *primary* representation only.
     ///
     /// Used for content-based dedup so two machines copying identical
-    /// content do not ping-pong it forever.
+    /// content do not ping-pong it forever. Hashing only the primary
+    /// representation (rather than every rep) is deliberate: a receiver can
+    /// advertise just one MIME type at a time, so the item it echoes back is
+    /// the primary rep alone. Hashing the primary makes that echo hash
+    /// identical to the broadcast item, which is what echo suppression
+    /// relies on when an item carries several representations.
     pub fn content_hash(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        for (mime, data) in &self.reps {
-            hasher.update(mime.as_bytes());
-            hasher.update([0]);
-            hasher.update(data);
-            hasher.update([0]);
+        match self.primary() {
+            Some((mime, data)) => rep_hash(mime, data),
+            None => rep_hash("", &[]),
         }
-        hasher.finalize().into()
     }
 }
 
@@ -108,7 +176,30 @@ mod tests {
     }
 
     #[test]
-    fn content_hash_stable_and_order_dependent() {
+    fn content_hash_ignores_secondary_reps() {
+        // The receiver advertises only the primary rep, so its echo carries a
+        // single rep. Hashing the primary alone keeps broadcast and echo
+        // hashes equal even when the sender bundles extra representations.
+        let primary = ("image/png".to_string(), vec![1u8, 2, 3, 4]);
+        let a = ClipboardItem {
+            origin: [1; 8],
+            serial: 1,
+            reps: vec![primary.clone()],
+        };
+        let b = ClipboardItem {
+            origin: [2; 8],
+            serial: 9,
+            reps: vec![
+                primary,
+                ("text/html".into(), b"<img>".to_vec()),
+                ("text/plain".into(), b"alt".to_vec()),
+            ],
+        };
+        assert_eq!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn content_hash_follows_the_primary_rep() {
         let a = ClipboardItem {
             origin: [1; 8],
             serial: 1,
@@ -119,14 +210,68 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a.content_hash(), b.content_hash());
+        // A different primary rep changes the identity of what gets pasted.
         let c = ClipboardItem {
             origin: [1; 8],
             serial: 2,
             reps: vec![a.reps[1].clone(), a.reps[0].clone()],
         };
-        // Same content, different rep order -> different hash is acceptable
-        // (ordering is significant).
         assert_ne!(a.content_hash(), c.content_hash());
+    }
+
+    #[test]
+    fn primary_helpers_report_the_first_rep() {
+        let item = ClipboardItem {
+            origin: [0; 8],
+            serial: 0,
+            reps: vec![
+                ("image/png".into(), vec![9, 9]),
+                ("text/plain".into(), b"alt".to_vec()),
+            ],
+        };
+        assert_eq!(item.primary_mime(), Some("image/png"));
+        assert_eq!(
+            item.primary().map(|(m, d)| (m.as_str(), d.len())),
+            Some(("image/png", 2))
+        );
+        assert!(item.primary_is_image());
+        assert!(!item.primary_is_text());
+        assert!(ClipboardItem::text("t", [0; 8], 0).primary_is_text());
+    }
+
+    #[test]
+    fn text_and_image_mime_detection() {
+        assert!(is_text_mime(MIME_TEXT_PLAIN));
+        assert!(is_text_mime("TEXT/PLAIN"));
+        assert!(is_text_mime("UTF8_STRING"));
+        // The legacy X11 target match is case-insensitive everywhere.
+        assert!(is_text_mime("utf8_string"));
+        assert!(is_text_mime("string"));
+        assert!(!is_text_mime(MIME_IMAGE_PNG));
+        assert!(is_image_mime("image/jpeg"));
+        assert!(is_image_mime("IMAGE/PNG"));
+        assert!(!is_image_mime(MIME_TEXT_PLAIN));
+    }
+
+    #[test]
+    fn rep_size_and_hash_are_consistent_with_the_item() {
+        let reps = vec![
+            ("image/png".to_string(), vec![1u8, 2, 3]),
+            ("text/plain".to_string(), b"hi".to_vec()),
+        ];
+        let item = ClipboardItem {
+            origin: [0; 8],
+            serial: 0,
+            reps: reps.clone(),
+        };
+        let expected: usize = reps.iter().map(|(m, d)| rep_size(m, d)).sum();
+        assert_eq!(item.total_size(), expected);
+        // The primary hash is exactly the primary rep's hash.
+        assert_eq!(item.content_hash(), rep_hash(&reps[0].0, &reps[0].1));
+        assert_ne!(
+            rep_hash(&reps[0].0, &reps[0].1),
+            rep_hash(&reps[1].0, &reps[1].1)
+        );
     }
 
     #[test]
@@ -220,15 +365,25 @@ mod tests {
     }
 
     #[test]
-    fn content_hash_differs_for_random_distinct_items() {
+    fn content_hash_differs_for_random_distinct_primaries() {
         let mut rng = Rng::new(0x1234);
         let mut seen = std::collections::HashSet::new();
-        // With random 32-byte data reps, collisions are astronomically unlikely.
-        for _ in 0..200 {
-            let item = random_item(&mut rng, false);
+        for i in 0..200u64 {
+            // A unique primary rep identifies the item; random secondary reps
+            // must not affect the hash.
+            let mut reps = vec![("image/png".to_string(), i.to_be_bytes().to_vec())];
+            for _ in 0..rng.range(4) {
+                let data: Vec<u8> = (0..1 + rng.range(32)).map(|_| rng.next() as u8).collect();
+                reps.push((format!("application/x-{}", rng.range(1000)), data));
+            }
+            let item = ClipboardItem {
+                origin: [rng.next() as u8; 8],
+                serial: rng.next(),
+                reps,
+            };
             assert!(
                 seen.insert(item.content_hash()),
-                "unexpected content-hash collision"
+                "collision for primary {i}"
             );
         }
     }

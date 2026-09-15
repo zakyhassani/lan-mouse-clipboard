@@ -15,7 +15,7 @@ use tokio::process::Command;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{BackendError, ClipboardBackend, parse_dbus_string, which};
-use crate::item::{ClipboardChange, ClipboardItem, MIME_TEXT_PLAIN};
+use crate::item::{ClipboardChange, ClipboardItem, MIME_TEXT_PLAIN, MIME_TEXT_PLAIN_ALT};
 
 const SERVICE: &str = "org.kde.klipper";
 const PATH: &str = "/klipper";
@@ -69,13 +69,19 @@ impl ClipboardBackend for DbusClipboardBackend {
     }
 
     async fn set(&self, item: &ClipboardItem) -> Result<(), BackendError> {
-        let Some((_mime, data)) = item
-            .reps
-            .iter()
-            .find(|(m, _)| m.to_ascii_lowercase().starts_with("text/plain"))
-        else {
-            return Err(BackendError::Other("no text/plain representation".into()));
+        let Some((mime, data)) = item.primary() else {
+            return Ok(());
         };
+        // klipper carries plain text only and always reports it back as
+        // `text/plain`. Applying any other primary rep would echo under a
+        // different MIME and defeat echo suppression, so skip it rather than
+        // falling back to a secondary text rep.
+        let is_plain = mime.eq_ignore_ascii_case(MIME_TEXT_PLAIN)
+            || mime.eq_ignore_ascii_case(MIME_TEXT_PLAIN_ALT);
+        if !is_plain {
+            log::debug!("klipper/dbus clipboard cannot carry {mime}; skipping");
+            return Ok(());
+        }
         let text = String::from_utf8_lossy(data).into_owned();
         let args = vec![
             "--session".to_string(),

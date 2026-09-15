@@ -1,7 +1,8 @@
 # Clipboard Sync
 
 Lan Mouse keeps the clipboards of connected machines in sync so that copying
-text on one host makes it available to paste on another.
+on one host makes it available to paste on another. Text and images are
+supported; the wire is MIME-agnostic, so other content travels unchanged too.
 
 > This is our own implementation, added on top of the original Lan Mouse
 > project (see the notice at the top of [README.md](./README.md)).
@@ -173,11 +174,12 @@ for each representation:
   data:     raw bytes
 ```
 
-The maximum total item size is `DEFAULT_MAX_ITEM_SIZE` (64 MiB), and a decoded
-payload is capped at that plus a small header margin. `FrameReader` accumulates
-raw stream bytes and splits them back into complete payloads, handling frames
-that span multiple reads as well as several frames within one read. Malformed
-lengths are rejected and the reader resynchronizes on the next length prefix.
+The maximum total item size is `max_item_size` (default
+`DEFAULT_MAX_ITEM_SIZE`, 64 MiB), and a decoded payload is capped at that plus
+a framing margin. `FrameReader` accumulates raw stream bytes and splits them
+back into complete payloads, handling frames that span multiple reads as well
+as several frames within one read. Malformed lengths are rejected and the
+reader resynchronizes on the next length prefix.
 
 ## Item model
 
@@ -203,9 +205,37 @@ flowchart LR
     ITEM --> REPS["reps: ordered (mime, data) list"]
 ```
 
-The wire format is MIME-agnostic. The current backends handle **plain text**
-(`text/plain;charset=utf-8`); other MIME types (e.g. images) are an additive
-extension.
+### Representations and images
+
+The wire format is MIME-agnostic, so images (and any other binary content)
+travel the same way as text: each representation is just a MIME type and its
+bytes. A local selection can offer several types at once (a browser image
+offers `image/png` alongside `text/html` and `text/plain`); the reading
+backend collects every transferable type, in the order the selection lists
+them, and the wire carries the whole ordered list.
+
+The **first representation is the primary**. It matters because a receiving
+backend can usually advertise only one MIME type at a time (`wl-copy` sets a
+single `--type`), so the receiver applies the primary representation and
+drops the rest:
+
+- The primary is chosen by the *sender*, following the order the selection
+  itself reports. `wl-paste --list-types` is the authority, so the source
+  application's own preference wins.
+- Protocol targets that are not data (`TARGETS`, `MULTIPLE`, `TIMESTAMP`,
+  `SAVE_TARGETS`, ...) are filtered out, as are the legacy X11 string aliases
+  (`UTF8_STRING`, `STRING`, `TEXT`) whenever at least one real MIME type is
+  offered.
+- Reading is binary-safe: `wl-paste --no-newline` is used for every type so
+  bytes (including image headers) are never altered.
+- Loop prevention hashes the **primary** representation only. The receiver's
+  echo carries just the primary, so hashing it the same way keeps the
+  broadcast and its echo identical and echo suppression correct.
+
+Sizes are bounded by `max_item_size` (see
+[Configuration & enabling](#configuration--enabling)): representations are
+added in order until the cap is reached, and an item whose primary
+representation alone exceeds the cap is dropped with a warning.
 
 ## Loop prevention
 
@@ -380,11 +410,11 @@ Backends are selected through `BackendKind`:
 | Kind         | Role        | Notes                                                        |
 |--------------|-------------|--------------------------------------------------------------|
 | `auto`       | (resolved)  | Picks the best available candidate automatically.            |
-| `wl-clipboard`| source+sink | Shells out to `wl-paste` / `wl-copy`; covers Noctalia v5 and similar. Handles plain text in v1. |
-| `cliphist`   | sink only   | Pipes received items into `cliphist store` to record history; never a change source. |
-| `klipper`    | source+sink | KDE clipboard via DBus (`dbus-send`).                        |
-| `dbus`       | source+sink | Generic DBus clipboard integration.                          |
-| `dummy`      | fallback    | In-memory backend used for testing and as a safe fallback.   |
+| `wl-clipboard`| source+sink | Shells out to `wl-paste` / `wl-copy`; covers Noctalia v5 and similar. Reads every offered MIME type (text and images); writes the primary representation. |
+| `cliphist`   | sink only   | Pipes received items into `cliphist store` to record history; never a change source. Stores the primary representation's MIME. |
+| `klipper`    | source+sink | KDE clipboard via DBus (`dbus-send`). Text only; rich items are skipped. |
+| `dbus`       | source+sink | Generic DBus clipboard integration. Text only.              |
+| `dummy`      | fallback    | In-memory backend used for testing and as a safe fallback.    |
 
 Resolution (`build_backends`):
 
@@ -431,12 +461,21 @@ Clipboard sync is configured in `config.toml` under a `clipboard` table:
 enabled = true
 # backend: "auto" | "wl-clipboard" | "cliphist" | "klipper" | "dbus"
 backend = "auto"
+# total size cap for a single item (all representations combined), in bytes
+# default 64 MiB; clamped to [1 KiB, 256 MiB]
+max_item_size = 67108864
 ```
 
 It can be toggled at runtime from the GTK frontend or the CLI. Enabling/disabling
 is routed to the driver (`SetEnabled`), which starts or stops the local
 clipboard watcher, and the frontend is notified via `Enabled` / `Disabled`
 events. The choice is persisted back into the config file.
+
+`max_item_size` bounds both directions on the host that sets it: it caps what
+the local backend reads and encodes, and it caps the payload the network task
+accepts. There is no negotiation, so **set the same value on every host**;
+a peer configured larger can send items a smaller peer rejects. The clamped
+range is `[1 KiB, 256 MiB]`.
 
 No extra ports or firewall rules are needed beyond the ones lan-mouse already
 uses, because the clipboard channel shares the same UDP/TCP port.

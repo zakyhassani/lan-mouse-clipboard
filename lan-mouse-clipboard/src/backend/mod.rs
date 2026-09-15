@@ -136,7 +136,10 @@ impl BackendKind {
 
 /// Resolve a configured `BackendKind` into an ordered list of backends:
 /// the primary (source + sink) first, followed by any attached history sinks.
-pub fn build_backends(kind: BackendKind) -> Vec<Box<dyn ClipboardBackend>> {
+///
+/// `max_item_size` bounds how much data a reading backend pulls from the
+/// selection (see `ClipboardItem`).
+pub fn build_backends(kind: BackendKind, max_item_size: usize) -> Vec<Box<dyn ClipboardBackend>> {
     // Only a single clipboard integration may run at a time. If a Wayland or
     // Noctalia clipboard manager is already running, the DBus (klipper)
     // integration must not also run or the two would fight over the clipboard.
@@ -159,7 +162,7 @@ pub fn build_backends(kind: BackendKind) -> Vec<Box<dyn ClipboardBackend>> {
         other => other,
     };
 
-    push_primary(&mut out, primary, wayland_active);
+    push_primary(&mut out, primary, wayland_active, max_item_size);
 
     // Attach a cliphist history sink if available and not already present.
     #[cfg(feature = "cliphist")]
@@ -185,12 +188,15 @@ fn push_primary(
     out: &mut Vec<Box<dyn ClipboardBackend>>,
     primary: BackendKind,
     wayland_active: bool,
+    max_item_size: usize,
 ) {
     match primary {
         BackendKind::Auto => unreachable!("resolved above"),
         BackendKind::Dummy => out.push(Box::new(dummy::DummyBackend::new())),
         #[cfg(feature = "wl-clipboard")]
-        BackendKind::WlClipboard => out.push(Box::new(wl_clipboard::WlClipboardBackend::new())),
+        BackendKind::WlClipboard => out.push(Box::new(wl_clipboard::WlClipboardBackend::new(
+            max_item_size,
+        ))),
         #[cfg(feature = "cliphist")]
         BackendKind::ClipHist => {
             // cliphist is a sink; if chosen as primary there is no source,
@@ -201,7 +207,7 @@ fn push_primary(
         #[cfg(feature = "klipper")]
         BackendKind::Klipper => {
             if wayland_active {
-                push_wayland_or_dummy(out, "klipper");
+                push_wayland_or_dummy(out, "klipper", max_item_size);
             } else {
                 out.push(Box::new(dbus_klipper::DbusClipboardBackend::new("klipper")));
             }
@@ -209,7 +215,7 @@ fn push_primary(
         #[cfg(feature = "dbus")]
         BackendKind::Dbus => {
             if wayland_active {
-                push_wayland_or_dummy(out, "dbus");
+                push_wayland_or_dummy(out, "dbus", max_item_size);
             } else {
                 out.push(Box::new(dbus_klipper::DbusClipboardBackend::new("dbus")));
             }
@@ -221,17 +227,24 @@ fn push_primary(
 /// clipboard is running: use the wl-clipboard backend when available, else a
 /// dummy, so exactly one integration owns the clipboard.
 #[cfg(any(feature = "klipper", feature = "dbus"))]
-fn push_wayland_or_dummy(out: &mut Vec<Box<dyn ClipboardBackend>>, dbus_name: &str) {
+fn push_wayland_or_dummy(
+    out: &mut Vec<Box<dyn ClipboardBackend>>,
+    dbus_name: &str,
+    max_item_size: usize,
+) {
     log::warn!(
         "wayland/noctalia clipboard is running; disabling {dbus_name} DBus integration to keep a single clipboard manager"
     );
     #[cfg(feature = "wl-clipboard")]
     {
         if wl_clipboard::WlClipboardBackend::available() {
-            out.push(Box::new(wl_clipboard::WlClipboardBackend::new()));
+            out.push(Box::new(wl_clipboard::WlClipboardBackend::new(
+                max_item_size,
+            )));
             return;
         }
     }
+    let _ = max_item_size;
     out.push(Box::new(dummy::DummyBackend::new()));
 }
 
@@ -405,7 +418,7 @@ mod tests {
 
     #[test]
     fn build_backends_dummy_yields_dummy_primary() {
-        let b = build_backends(BackendKind::Dummy);
+        let b = build_backends(BackendKind::Dummy, 64 * 1024 * 1024);
         assert!(!b.is_empty());
         assert_eq!(b[0].name(), "dummy");
     }
@@ -413,7 +426,7 @@ mod tests {
     #[test]
     fn build_backends_auto_falls_back_to_dummy_without_tools() {
         run_with_path(&[], || {
-            let b = build_backends(BackendKind::Auto);
+            let b = build_backends(BackendKind::Auto, 64 * 1024 * 1024);
             assert!(!b.is_empty());
             assert_eq!(b[0].name(), "dummy");
         });
@@ -435,7 +448,7 @@ mod tests {
     fn push_primary_uses_wayland_when_dbus_disabled_and_tools_present() {
         run_with_path(&["wl-paste", "wl-copy"], || {
             let mut out: Vec<Box<dyn ClipboardBackend>> = Vec::new();
-            push_primary(&mut out, BackendKind::Klipper, true);
+            push_primary(&mut out, BackendKind::Klipper, true, 64 * 1024 * 1024);
             assert_eq!(out.len(), 1);
             // DBus disabled: single integration becomes wl-clipboard.
             assert_eq!(out[0].name(), "wl-clipboard");
@@ -447,7 +460,7 @@ mod tests {
     fn push_primary_dbus_disabled_falls_back_to_dummy_without_tools() {
         run_with_path(&[], || {
             let mut out: Vec<Box<dyn ClipboardBackend>> = Vec::new();
-            push_primary(&mut out, BackendKind::Klipper, true);
+            push_primary(&mut out, BackendKind::Klipper, true, 64 * 1024 * 1024);
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].name(), "dummy");
         });
@@ -457,7 +470,7 @@ mod tests {
     #[cfg(feature = "klipper")]
     fn push_primary_keeps_dbus_when_wayland_not_running() {
         let mut out: Vec<Box<dyn ClipboardBackend>> = Vec::new();
-        push_primary(&mut out, BackendKind::Klipper, false);
+        push_primary(&mut out, BackendKind::Klipper, false, 64 * 1024 * 1024);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name(), "klipper");
     }

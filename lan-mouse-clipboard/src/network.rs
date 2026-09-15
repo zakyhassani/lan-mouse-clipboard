@@ -63,6 +63,15 @@ impl PeerEndpoints {
     }
 }
 
+/// Runtime limits for the clipboard network task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkLimits {
+    /// Total size cap for a single item; bounds inbound frames.
+    pub max_item_size: usize,
+    /// Idle timeout for outgoing connections.
+    pub idle_timeout: Duration,
+}
+
 /// Internal signals from a per-peer read loop back to the network loop.
 enum HealthEvent {
     /// A ping arrived (from `addr`); reply with a pong.
@@ -98,9 +107,17 @@ pub async fn run_clipboard_server(
     mut peers: watch::Receiver<Vec<PeerEndpoints>>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     mut broadcast_rx: mpsc::Receiver<Vec<u8>>,
-    idle_timeout: Duration,
+    limits: NetworkLimits,
     event_tx: mpsc::Sender<NetworkEvent>,
 ) {
+    let NetworkLimits {
+        max_item_size,
+        idle_timeout,
+    } = limits;
+    // Inbound frames are capped at the configured item size (plus framing
+    // overhead); this is the receive-side guard matching the driver's
+    // encode-side cap.
+    let max_payload = crate::protocol::max_payload_size(max_item_size);
     let mut registry = ConnectionRegistry::new(idle_timeout);
     // Channel from background connect-tasks back to this loop. Carries the
     // peer id so a failed dial can rotate that peer to its next fallback.
@@ -263,7 +280,7 @@ pub async fn run_clipboard_server(
                             let tx = inbound_tx.clone();
                             let dtx = disc_tx.clone();
                             let htx = health_tx.clone();
-                            tokio::spawn(read_loop(r, addr, tx, dtx, htx));
+                            tokio::spawn(read_loop(r, addr, tx, dtx, htx, max_payload));
                             // Retrain IPs on every connect so peers converge
                             // on the live address.
                             let _ = event_tx.try_send(NetworkEvent::Retrain);
@@ -328,7 +345,7 @@ pub async fn run_clipboard_server(
                     let tx = inbound_tx.clone();
                     let dtx = disc_tx.clone();
                     let htx = health_tx.clone();
-                    tokio::spawn(read_loop(r, addr, tx, dtx, htx));
+                    tokio::spawn(read_loop(r, addr, tx, dtx, htx, max_payload));
                     let _ = event_tx.try_send(NetworkEvent::Retrain);
                 }
             }
@@ -452,11 +469,12 @@ async fn read_loop<R>(
     tx: mpsc::Sender<Vec<u8>>,
     disc_tx: mpsc::Sender<SocketAddr>,
     health_tx: mpsc::Sender<HealthEvent>,
+    max_payload: usize,
 ) where
     R: AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; 8192];
-    let mut frames = FrameReader::new();
+    let mut frames = FrameReader::with_max_payload(max_payload);
     loop {
         let n = match reader.read(&mut buf).await {
             Ok(0) => break,
@@ -485,8 +503,9 @@ async fn read_loop<R>(
                 Ok(None) => break,
                 Err(e) => {
                     log::debug!("clipboard frame from {addr} invalid: {e}");
-                    // Drop the frame buffer and resync on the next length prefix.
-                    frames = FrameReader::new();
+                    // Drop the frame buffer and resync on the next length
+                    // prefix, keeping the configured payload cap.
+                    frames = FrameReader::with_max_payload(max_payload);
                     break;
                 }
             }
@@ -585,7 +604,10 @@ mod tests {
             peers_a_rx,
             in_a_tx,
             bc_a_rx,
-            Duration::from_secs(60),
+            NetworkLimits {
+                max_item_size: 64 * 1024 * 1024,
+                idle_timeout: Duration::from_secs(60),
+            },
             ev_a_tx,
         ));
         // B only listens/accepts (single initiated connection, as enforced in
@@ -597,7 +619,10 @@ mod tests {
             peers_b_rx,
             in_b_tx,
             bc_b_rx,
-            Duration::from_secs(60),
+            NetworkLimits {
+                max_item_size: 64 * 1024 * 1024,
+                idle_timeout: Duration::from_secs(60),
+            },
             ev_b_tx,
         ));
         // Keep the senders alive so the receivers keep yielding the latest value.
@@ -661,7 +686,14 @@ mod tests {
         let frame = Message::Announce(item).encode(1024).unwrap();
 
         let (r_half, _w_half) = split(r);
-        let task = tokio::spawn(read_loop(r_half, addr, tx, dtx, htx));
+        let task = tokio::spawn(read_loop(
+            r_half,
+            addr,
+            tx,
+            dtx,
+            htx,
+            crate::protocol::MAX_PAYLOAD_SIZE,
+        ));
 
         w.write_all(&frame).await.unwrap();
         drop(w); // EOF signals the read loop to stop
@@ -683,7 +715,14 @@ mod tests {
         let good = Message::Announce(item).encode(1024).unwrap();
 
         let (r_half, _w_half) = split(r);
-        let task = tokio::spawn(read_loop(r_half, addr, tx, dtx, htx));
+        let task = tokio::spawn(read_loop(
+            r_half,
+            addr,
+            tx,
+            dtx,
+            htx,
+            crate::protocol::MAX_PAYLOAD_SIZE,
+        ));
 
         // A length prefix that claims a 4 GiB payload -> rejected -> resync.
         w.write_all(&[0xff, 0xff, 0xff, 0xff]).await.unwrap();

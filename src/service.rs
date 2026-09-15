@@ -722,9 +722,11 @@ async fn setup_clipboard(
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(64);
     let (broadcast_tx, broadcast_rx) = tokio::sync::mpsc::channel(64);
     let origin = lan_mouse_clipboard::item::origin_from_fingerprint(public_key_fingerprint);
+    let max_item_size = config.clipboard_max_item_size();
     let clipboard = lan_mouse_clipboard::Clipboard::new(
         config.clipboard_enabled(),
         config.clipboard_backend(),
+        max_item_size,
         origin,
         inbound_rx,
         broadcast_tx,
@@ -734,9 +736,8 @@ async fn setup_clipboard(
     let (peers_tx, peers_rx) =
         tokio::sync::watch::channel::<Vec<network::PeerEndpoints>>(Vec::new());
     let task = match setup_clipboard_network(
-        config.cert_path(),
-        config.port(),
-        config.authorized_fingerprints(),
+        config,
+        max_item_size,
         inbound_tx,
         broadcast_rx,
         peers_rx,
@@ -758,21 +759,20 @@ async fn setup_clipboard(
 
 /// Bind the clipboard TLS listener and spawn the network task.
 async fn setup_clipboard_network(
-    cert_path: &std::path::Path,
-    port: u16,
-    authorized: HashMap<String, String>,
+    config: &Config,
+    max_item_size: usize,
     inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     broadcast_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     peers_rx: tokio::sync::watch::Receiver<Vec<network::PeerEndpoints>>,
     events_tx: tokio::sync::mpsc::Sender<network::NetworkEvent>,
 ) -> Result<tokio::task::JoinHandle<()>, transport::TransportError> {
-    let pem = std::fs::read_to_string(cert_path)?;
+    let pem = std::fs::read_to_string(config.cert_path())?;
     let identity = transport::load_identity(&pem)?;
     let client_config = transport::client_config(&identity)?;
     let listener = transport::TlsListener::bind(
-        SocketAddr::from(([0, 0, 0, 0], port)),
+        SocketAddr::from(([0, 0, 0, 0], config.port())),
         &identity,
-        authorized,
+        config.authorized_fingerprints(),
     )
     .await?;
     let task = tokio::spawn(network::run_clipboard_server(
@@ -781,7 +781,10 @@ async fn setup_clipboard_network(
         peers_rx,
         inbound_tx,
         broadcast_rx,
-        std::time::Duration::from_secs(60),
+        network::NetworkLimits {
+            max_item_size,
+            idle_timeout: std::time::Duration::from_secs(60),
+        },
         events_tx,
     ));
     Ok(task)

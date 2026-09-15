@@ -78,6 +78,14 @@ struct ConfigToml {
 struct ClipboardConfig {
     enabled: Option<bool>,
     backend: Option<BackendKind>,
+    /// total size cap for a single clipboard item, in bytes
+    max_item_size: Option<usize>,
+}
+
+/// Clamp a configured clipboard item size to the supported range so a bad
+/// value cannot cause unbounded allocations.
+fn clamp_clipboard_item_size(configured: usize) -> usize {
+    configured.clamp(1024, lan_mouse_clipboard::MAX_ITEM_SIZE_LIMIT)
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -486,6 +494,21 @@ impl Config {
         cb.enabled = Some(enabled);
     }
 
+    /// total size cap for one clipboard item (all representations combined)
+    ///
+    /// Clamped to `[1 KiB, MAX_ITEM_SIZE_LIMIT]` so a bad config value cannot
+    /// cause unbounded allocations. Images are the reason the cap exists: a
+    /// single screenshot can be several MiB.
+    pub fn clipboard_max_item_size(&self) -> usize {
+        let configured = self
+            .config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard.as_ref())
+            .and_then(|cb| cb.max_item_size)
+            .unwrap_or(lan_mouse_clipboard::DEFAULT_MAX_ITEM_SIZE);
+        clamp_clipboard_item_size(configured)
+    }
+
     /// optional input-capture backend override
     pub fn capture_backend(&self) -> Option<CaptureBackend> {
         self.args
@@ -610,5 +633,36 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_item_size_is_clamped_to_a_supported_range() {
+        assert_eq!(clamp_clipboard_item_size(0), 1024);
+        assert_eq!(
+            clamp_clipboard_item_size(lan_mouse_clipboard::MAX_ITEM_SIZE_LIMIT * 4),
+            lan_mouse_clipboard::MAX_ITEM_SIZE_LIMIT
+        );
+        assert_eq!(clamp_clipboard_item_size(8 * 1024 * 1024), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn clipboard_config_parses_max_item_size() {
+        let toml: ConfigToml = toml::from_str(
+            r#"
+            [clipboard]
+            enabled = true
+            backend = "wl-clipboard"
+            max_item_size = 33554432
+            "#,
+        )
+        .expect("parse");
+        let cb = toml.clipboard.expect("clipboard");
+        assert_eq!(cb.enabled, Some(true));
+        assert_eq!(cb.max_item_size, Some(33_554_432));
     }
 }
