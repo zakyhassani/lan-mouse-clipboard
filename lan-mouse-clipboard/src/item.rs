@@ -14,9 +14,6 @@ pub const MIME_TEXT_PLAIN: &str = "text/plain;charset=utf-8";
 /// Common alias for plain text without a charset parameter.
 pub const MIME_TEXT_PLAIN_ALT: &str = "text/plain";
 
-/// MIME type for PNG images (the common clipboard image format).
-pub const MIME_IMAGE_PNG: &str = "image/png";
-
 /// Legacy X11 string targets. They carry text but are not MIME types, so they
 /// are only transferable as a fallback when a selection offers no MIME type.
 pub const X11_TEXT_TARGETS: &[&str] = &["UTF8_STRING", "STRING", "TEXT"];
@@ -56,6 +53,9 @@ pub fn rep_hash(mime: &str, data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// One MIME representation: its type plus the raw bytes.
+pub type ClipboardRep = (String, Vec<u8>);
+
 /// A clipboard item with one or more MIME representations.
 ///
 /// `origin` is the 8-byte id of the machine that created the item and
@@ -68,7 +68,7 @@ pub struct ClipboardItem {
     /// monotonic per-machine counter, incremented per locally-originated item
     pub serial: u64,
     /// ordered list of (mime, data) representations; sender-preferred mime first
-    pub reps: Vec<(String, Vec<u8>)>,
+    pub reps: Vec<ClipboardRep>,
 }
 
 impl ClipboardItem {
@@ -88,7 +88,7 @@ impl ClipboardItem {
 
     /// The primary representation: the one receivers apply when they can only
     /// advertise a single MIME type (sender-preferred, so first).
-    pub fn primary(&self) -> Option<&(String, Vec<u8>)> {
+    pub fn primary(&self) -> Option<&ClipboardRep> {
         self.reps.first()
     }
 
@@ -97,21 +97,10 @@ impl ClipboardItem {
         self.reps.first().map(|(m, _)| m.as_str())
     }
 
-    /// Whether the primary representation is plain text.
-    pub fn primary_is_text(&self) -> bool {
-        self.primary_mime().is_some_and(is_text_mime)
-    }
-
-    /// Whether the primary representation is an image.
-    pub fn primary_is_image(&self) -> bool {
-        self.primary_mime().is_some_and(is_image_mime)
-    }
-
-    /// Best-effort UTF-8 text extraction, preferring the plain-text MIME types.
+    /// Best-effort UTF-8 text extraction from the first plain-text rep.
     pub fn text_plain(&self) -> Option<String> {
         for (mime, data) in &self.reps {
-            let m = mime.to_ascii_lowercase();
-            if m == MIME_TEXT_PLAIN || m == MIME_TEXT_PLAIN_ALT || m.starts_with("text/plain") {
+            if mime.to_ascii_lowercase().starts_with("text/plain") {
                 return String::from_utf8(data.clone()).ok();
             }
         }
@@ -158,6 +147,7 @@ pub fn origin_from_fingerprint(fingerprint: &str) -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::Rng;
 
     #[test]
     fn origin_from_fingerprint_is_stable_and_unique() {
@@ -234,9 +224,6 @@ mod tests {
             item.primary().map(|(m, d)| (m.as_str(), d.len())),
             Some(("image/png", 2))
         );
-        assert!(item.primary_is_image());
-        assert!(!item.primary_is_text());
-        assert!(ClipboardItem::text("t", [0; 8], 0).primary_is_text());
     }
 
     #[test]
@@ -247,7 +234,7 @@ mod tests {
         // The legacy X11 target match is case-insensitive everywhere.
         assert!(is_text_mime("utf8_string"));
         assert!(is_text_mime("string"));
-        assert!(!is_text_mime(MIME_IMAGE_PNG));
+        assert!(!is_text_mime("image/png"));
         assert!(is_image_mime("image/jpeg"));
         assert!(is_image_mime("IMAGE/PNG"));
         assert!(!is_image_mime(MIME_TEXT_PLAIN));
@@ -315,25 +302,6 @@ mod tests {
     }
 
     // ---- deterministic PRNG for randomized tests (no external deps) ----
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-        }
-        fn next(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x
-        }
-        fn range(&mut self, hi: usize) -> usize {
-            (self.next() % hi.max(1) as u64) as usize
-        }
-    }
 
     fn random_item(rng: &mut Rng, with_text: bool) -> ClipboardItem {
         let mut reps = Vec::new();

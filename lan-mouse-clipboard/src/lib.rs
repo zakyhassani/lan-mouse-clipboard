@@ -14,6 +14,9 @@ pub mod protocol;
 pub mod registry;
 pub mod transport;
 
+#[cfg(test)]
+mod test_util;
+
 pub use backend::BackendKind;
 pub use item::{ClipboardItem, DEFAULT_MAX_ITEM_SIZE, MAX_ITEM_SIZE_LIMIT};
 
@@ -34,14 +37,6 @@ pub enum ClipboardEvent {
     Enabled,
     /// Clipboard sync became disabled.
     Disabled,
-}
-
-/// Public status mirroring `lan_mouse_ipc::Status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ClipboardStatus {
-    #[default]
-    Disabled,
-    Enabled,
 }
 
 enum ClipboardRequest {
@@ -216,6 +211,7 @@ async fn poll_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::Rng;
 
     #[tokio::test]
     async fn set_enabled_emits_event() {
@@ -427,7 +423,7 @@ mod tests {
             Message::Announce(item) => {
                 assert_eq!(item.origin, [0xAA; 8]);
                 assert!(item.serial >= 1);
-                assert!(item.primary_is_image());
+                assert_eq!(item.primary_mime(), Some("image/png"));
                 assert_eq!(item.reps.len(), 3, "all offered reps travel");
             }
             other => panic!("expected Announce, got {other:?}"),
@@ -529,21 +525,6 @@ mod tests {
             drv.broadcast_rx.try_recv().is_err(),
             "echo of a remote item must be suppressed"
         );
-    }
-
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-        }
-        fn next(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x
-        }
     }
 
     #[tokio::test]

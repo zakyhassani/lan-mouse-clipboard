@@ -21,13 +21,14 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use futures::{Stream, StreamExt, stream};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use tokio_stream::wrappers::{LinesStream, ReceiverStream};
 
 use super::{BackendError, ClipboardBackend, which};
 use crate::item::{
-    ClipboardChange, ClipboardItem, DEFAULT_MAX_ITEM_SIZE, X11_TEXT_TARGETS, is_text_mime, rep_size,
+    ClipboardChange, ClipboardItem, ClipboardRep, DEFAULT_MAX_ITEM_SIZE, X11_TEXT_TARGETS,
+    is_image_mime, is_text_mime, rep_size,
 };
 
 /// Per-tool timeout. A misbehaving selection target must not hang the
@@ -100,7 +101,7 @@ fn image_rank(t: &str) -> Option<u8> {
         "image/jpeg" => Some(2),
         "image/bmp" => Some(3),
         "image/tiff" => Some(4),
-        _ if m.starts_with("image/") => Some(5),
+        _ if is_image_mime(&m) => Some(5),
         _ => None,
     }
 }
@@ -190,24 +191,81 @@ async fn read_rep(mime: &str, max_bytes: usize) -> Option<Vec<u8>> {
         let mut limited = stdout.take(max_bytes as u64 + 1);
         limited.read_to_end(&mut buf).await
     };
-    match tokio::time::timeout(READ_TIMEOUT, read).await {
-        Ok(Ok(_)) => {}
-        _ => {
-            let _ = child.kill().await;
-            return None;
-        }
-    }
-    if buf.len() > max_bytes {
+    let ok = matches!(tokio::time::timeout(READ_TIMEOUT, read).await, Ok(Ok(_)))
+        && buf.len() <= max_bytes
+        && matches!(
+            tokio::time::timeout(READ_TIMEOUT, child.wait()).await,
+            Ok(Ok(status)) if status.success()
+        );
+    if ok {
+        Some(buf)
+    } else {
         let _ = child.kill().await;
+        None
+    }
+}
+
+/// Read the supported representations of the current selection.
+///
+/// Lists the offered types, reads them with bounded concurrency (preserving
+/// the offered order), and accumulates representations until the size cap is
+/// reached. Returns `None` when there is no selection, nothing supported, or
+/// the first representation alone exceeds the cap.
+async fn read_selection(max_item_size: usize) -> Option<Vec<ClipboardRep>> {
+    let mut list = Command::new("wl-paste");
+    list.arg("--list-types").kill_on_drop(true);
+    let listed = tokio::time::timeout(READ_TIMEOUT, list.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !listed.status.success() {
         return None;
     }
-    match tokio::time::timeout(READ_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) if status.success() => Some(buf),
-        _ => {
-            let _ = child.kill().await;
-            None
-        }
+    let types = select_types(&String::from_utf8_lossy(&listed.stdout));
+    if types.is_empty() {
+        return None;
     }
+
+    // `buffered` keeps the offered order, and each read is individually
+    // capped, so a huge rep cannot exhaust memory and breaking out cancels
+    // the remaining reads (killing their children).
+    let reads = stream::iter(types.into_iter().map(|mime| async move {
+        let data = read_rep(&mime, max_item_size).await;
+        (mime, data)
+    }))
+    .buffered(READ_CONCURRENCY);
+    futures::pin_mut!(reads);
+
+    let mut reps: Vec<ClipboardRep> = Vec::new();
+    let mut total = 0usize;
+    while let Some((mime, data)) = reads.next().await {
+        if reps.len() >= MAX_REPS {
+            break;
+        }
+        let Some(data) = data else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        let size = rep_size(&mime, &data);
+        if total + size > max_item_size {
+            if reps.is_empty() {
+                log::warn!(
+                    "clipboard type {mime} is {size} bytes, over the {max_item_size} byte cap; skipping item"
+                );
+                return None;
+            }
+            log::debug!(
+                "clipboard type {mime} would exceed the {max_item_size} byte cap; dropping remaining reps"
+            );
+            break;
+        }
+        total += size;
+        reps.push((mime, data));
+    }
+
+    if reps.is_empty() { None } else { Some(reps) }
 }
 
 #[async_trait::async_trait]
@@ -217,64 +275,7 @@ impl ClipboardBackend for WlClipboardBackend {
     }
 
     async fn read_current(&self) -> Option<ClipboardItem> {
-        let mut list = Command::new("wl-paste");
-        list.arg("--list-types").kill_on_drop(true);
-        let listed = tokio::time::timeout(READ_TIMEOUT, list.output())
-            .await
-            .ok()?
-            .ok()?;
-        if !listed.status.success() {
-            return None;
-        }
-        let types = select_types(&String::from_utf8_lossy(&listed.stdout));
-        if types.is_empty() {
-            return None;
-        }
-
-        // Read the offered types with bounded concurrency. `buffered` keeps
-        // the offered order, and each read is individually capped, so a huge
-        // rep cannot exhaust memory and breaking out cancels the remaining
-        // reads (killing their children).
-        let max = self.max_item_size;
-        let reads = stream::iter(types.into_iter().map(|mime| async move {
-            let data = read_rep(&mime, max).await;
-            (mime, data)
-        }))
-        .buffered(READ_CONCURRENCY);
-        futures::pin_mut!(reads);
-
-        let mut reps: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut total = 0usize;
-        while let Some((mime, data)) = reads.next().await {
-            if reps.len() >= MAX_REPS {
-                break;
-            }
-            let Some(data) = data else {
-                continue;
-            };
-            if data.is_empty() {
-                continue;
-            }
-            let size = rep_size(&mime, &data);
-            if total + size > max {
-                if reps.is_empty() {
-                    log::warn!(
-                        "clipboard type {mime} is {size} bytes, over the {max} byte cap; skipping item"
-                    );
-                    return None;
-                }
-                log::debug!(
-                    "clipboard type {mime} would exceed the {max} byte cap; dropping remaining reps"
-                );
-                break;
-            }
-            total += size;
-            reps.push((mime, data));
-        }
-
-        if reps.is_empty() {
-            return None;
-        }
+        let reps = read_selection(self.max_item_size).await?;
         Some(ClipboardItem {
             origin: [0; 8],
             serial: 0,
@@ -286,18 +287,9 @@ impl ClipboardBackend for WlClipboardBackend {
         let Some((mime, data)) = item.primary() else {
             return Err(BackendError::Other("item has no representations".into()));
         };
-        let mut child = Command::new("wl-copy")
-            .arg("--type")
-            .arg(mime)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(data).await?;
-            stdin.flush().await?;
-        }
-        let status = child.wait().await?;
+        let mut cmd = Command::new("wl-copy");
+        cmd.arg("--type").arg(mime);
+        let status = super::pipe_stdin(cmd, data).await?;
         if !status.success() {
             return Err(BackendError::Other(format!("wl-copy failed: {status}")));
         }

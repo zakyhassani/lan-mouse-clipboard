@@ -147,18 +147,10 @@ pub fn build_backends(kind: BackendKind, max_item_size: usize) -> Vec<Box<dyn Cl
     let mut out: Vec<Box<dyn ClipboardBackend>> = Vec::new();
 
     let primary = match kind {
-        BackendKind::Auto => {
-            let chosen = BackendKind::candidates()
-                .into_iter()
-                .filter(|b| {
-                    *b != BackendKind::Auto && b.available() && !(wayland_active && b.is_dbus())
-                })
-                .find(|_| true);
-            match chosen {
-                Some(b) => b,
-                None => BackendKind::Dummy,
-            }
-        }
+        BackendKind::Auto => BackendKind::candidates()
+            .into_iter()
+            .find(|b| *b != BackendKind::Auto && b.available() && !(wayland_active && b.is_dbus()))
+            .unwrap_or(BackendKind::Dummy),
         other => other,
     };
 
@@ -194,9 +186,7 @@ fn push_primary(
         BackendKind::Auto => unreachable!("resolved above"),
         BackendKind::Dummy => out.push(Box::new(dummy::DummyBackend::new())),
         #[cfg(feature = "wl-clipboard")]
-        BackendKind::WlClipboard => out.push(Box::new(wl_clipboard::WlClipboardBackend::new(
-            max_item_size,
-        ))),
+        BackendKind::WlClipboard => out.push(wl_backend(max_item_size)),
         #[cfg(feature = "cliphist")]
         BackendKind::ClipHist => {
             // cliphist is a sink; if chosen as primary there is no source,
@@ -205,53 +195,71 @@ fn push_primary(
             out.push(Box::new(cliphist::ClipHistBackend::new()));
         }
         #[cfg(feature = "klipper")]
-        BackendKind::Klipper => {
-            if wayland_active {
-                push_wayland_or_dummy(out, "klipper", max_item_size);
-            } else {
-                out.push(Box::new(dbus_klipper::DbusClipboardBackend::new("klipper")));
-            }
-        }
+        BackendKind::Klipper => push_dbus(out, "klipper", wayland_active, max_item_size),
         #[cfg(feature = "dbus")]
-        BackendKind::Dbus => {
-            if wayland_active {
-                push_wayland_or_dummy(out, "dbus", max_item_size);
-            } else {
-                out.push(Box::new(dbus_klipper::DbusClipboardBackend::new("dbus")));
-            }
-        }
+        BackendKind::Dbus => push_dbus(out, "dbus", wayland_active, max_item_size),
     }
 }
 
-/// Fallback used when a DBus integration is requested but a Wayland/Noctalia
-/// clipboard is running: use the wl-clipboard backend when available, else a
-/// dummy, so exactly one integration owns the clipboard.
+/// Push a DBus integration, or the wl-clipboard/dummy fallback when a
+/// Wayland/Noctalia clipboard already owns the selection: exactly one
+/// integration must run, or they fight over the clipboard.
 #[cfg(any(feature = "klipper", feature = "dbus"))]
-fn push_wayland_or_dummy(
+fn push_dbus(
     out: &mut Vec<Box<dyn ClipboardBackend>>,
-    dbus_name: &str,
+    name: &'static str,
+    wayland_active: bool,
     max_item_size: usize,
 ) {
+    if !wayland_active {
+        out.push(Box::new(dbus_klipper::DbusClipboardBackend::new(name)));
+        return;
+    }
     log::warn!(
-        "wayland/noctalia clipboard is running; disabling {dbus_name} DBus integration to keep a single clipboard manager"
+        "wayland/noctalia clipboard is running; disabling {name} DBus integration to keep a single clipboard manager"
     );
     #[cfg(feature = "wl-clipboard")]
-    {
-        if wl_clipboard::WlClipboardBackend::available() {
-            out.push(Box::new(wl_clipboard::WlClipboardBackend::new(
-                max_item_size,
-            )));
-            return;
-        }
+    if wl_clipboard::WlClipboardBackend::available() {
+        out.push(wl_backend(max_item_size));
+        return;
     }
     let _ = max_item_size;
     out.push(Box::new(dummy::DummyBackend::new()));
+}
+
+/// Construct a wl-clipboard backend (source + sink).
+#[cfg(feature = "wl-clipboard")]
+fn wl_backend(max_item_size: usize) -> Box<dyn ClipboardBackend> {
+    Box::new(wl_clipboard::WlClipboardBackend::new(max_item_size))
 }
 
 /// Whether an executable is available on `$PATH`.
 fn which(name: &str) -> bool {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
+}
+
+/// Spawn `cmd` with piped stdin (null stdout/stderr), write `data`, and wait.
+///
+/// Shared by the sink backends that pipe an item's bytes into an external
+/// tool (`wl-copy`, `cliphist`). The returned status is not interpreted here,
+/// so each caller can decide whether a failure is fatal.
+pub(crate) async fn pipe_stdin(
+    mut cmd: tokio::process::Command,
+    data: &[u8],
+) -> std::io::Result<std::process::ExitStatus> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(data).await?;
+        stdin.flush().await?;
+    }
+    child.wait().await
 }
 
 /// Process names that indicate an active Wayland or Noctalia clipboard
@@ -276,40 +284,37 @@ const WAYLAND_CLIPBOARD_PROCS: &[&str] = &[
 /// the truncated `comm` (15 char) name and the first command-line argument.
 /// Returns `false` (never errors) if `/proc` is not available.
 pub fn wayland_clipboard_running() -> bool {
-    fn comm_matches(p: &std::path::Path) -> bool {
-        if let Ok(c) = std::fs::read_to_string(p.join("comm")) {
-            let c = c.trim();
-            if WAYLAND_CLIPBOARD_PROCS.contains(&c) {
+    /// `comm` (possibly truncated) or the basename of argv[0].
+    fn is_clipboard_proc(p: &std::path::Path) -> bool {
+        if let Ok(comm) = std::fs::read_to_string(p.join("comm")) {
+            if WAYLAND_CLIPBOARD_PROCS.contains(&comm.trim()) {
                 return true;
             }
         }
-        // Some managers have a distinct argv[0] even when `comm` is truncated.
-        if let Ok(raw) = std::fs::read(p.join("cmdline")) {
-            if let Some(first) = raw.split(|&b| b == 0).next() {
-                if let Ok(s) = std::str::from_utf8(first) {
-                    if let Some(base) = std::path::Path::new(s).file_name().and_then(|f| f.to_str())
-                    {
-                        return WAYLAND_CLIPBOARD_PROCS.contains(&base);
-                    }
-                }
-            }
-        }
-        false
+        std::fs::read(p.join("cmdline"))
+            .ok()
+            .and_then(|raw| raw.split(|&b| b == 0).next().map(<[u8]>::to_vec))
+            .and_then(|first| String::from_utf8(first).ok())
+            .and_then(|s| {
+                std::path::Path::new(&s)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .map(str::to_string)
+            })
+            .is_some_and(|base| WAYLAND_CLIPBOARD_PROCS.contains(&base.as_str()))
     }
 
     let Ok(rd) = std::fs::read_dir("/proc") else {
         return false;
     };
-    for entry in rd.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        if comm_matches(&entry.path()) {
-            return true;
-        }
-    }
-    false
+    rd.flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        })
+        .any(|e| is_clipboard_proc(&e.path()))
 }
 
 /// Loosely extract `string "..."` from `dbus-send --print-reply` output.

@@ -197,6 +197,46 @@ pub async fn connect(
         .map_err(|e| TransportError::Handshake(e.to_string()))
 }
 
+/// Implement the certificate verifiers' shared signature checks, which all
+/// delegate to the provider's signature-verification algorithms.
+macro_rules! provider_signature_checks {
+    () => {
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, RlsError> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, RlsError> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    };
+}
+
 /// Verifier that accepts any client certificate at the TLS layer; the
 /// listening side checks the fingerprint after the handshake.
 #[derive(Debug)]
@@ -226,39 +266,7 @@ impl ClientCertVerifier for AcceptAnyClientCertVerifier {
         Ok(ClientCertVerified::assertion())
     }
 
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RlsError> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RlsError> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
+    provider_signature_checks! {}
 }
 
 /// Verifier that accepts any server certificate (self-signed peers).
@@ -279,39 +287,7 @@ impl ServerCertVerifier for AcceptAnyServerCertVerifier {
         Ok(ServerCertVerified::assertion())
     }
 
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RlsError> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RlsError> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
+    provider_signature_checks! {}
 }
 
 #[cfg(test)]
@@ -319,11 +295,7 @@ mod tests {
     use super::*;
 
     fn test_identity(cn: &str) -> Identity {
-        let key = rcgen::KeyPair::generate().expect("generate key");
-        let params = rcgen::CertificateParams::new(vec![cn.to_string()]).expect("params");
-        let cert = params.self_signed(&key).expect("self-signed cert");
-        let pem = format!("{}{}", cert.pem(), key.serialize_pem());
-        load_identity(&pem).expect("load identity")
+        load_identity(&crate::test_util::identity_pem(cn)).expect("load identity")
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -384,10 +356,7 @@ mod tests {
     fn loads_nonstandard_private_key_label() {
         // lan-mouse writes EC keys with the underscore form; load_identity
         // must normalize it to the standard PKCS8 label.
-        let key = rcgen::KeyPair::generate().expect("generate key");
-        let params = rcgen::CertificateParams::new(vec!["cn".into()]).expect("params");
-        let cert = params.self_signed(&key).expect("self-signed");
-        let mut pem = format!("{}{}", cert.pem(), key.serialize_pem());
+        let (mut pem, ..) = crate::test_util::test_cert("cn");
         pem = pem.replace("PRIVATE KEY", "PRIVATE_KEY");
         let identity = load_identity(&pem).expect("load identity with PRIVATE_KEY");
         assert!(!identity.certs.is_empty());
@@ -395,10 +364,7 @@ mod tests {
 
     #[test]
     fn fingerprint_hex_is_colon_separated_lowercase_sha256() {
-        let key = rcgen::KeyPair::generate().expect("generate key");
-        let params = rcgen::CertificateParams::new(vec!["cn".into()]).expect("params");
-        let cert = params.self_signed(&key).expect("self-signed");
-        let fp = fingerprint_hex(&cert.der().to_owned());
+        let fp = fingerprint_hex(&crate::test_util::test_cert("cn").3);
         let parts: Vec<&str> = fp.split(':').collect();
         assert_eq!(parts.len(), 32);
         assert!(
@@ -411,29 +377,22 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_for_same_cert() {
-        let key = rcgen::KeyPair::generate().expect("generate key");
-        let params = rcgen::CertificateParams::new(vec!["cn".into()]).expect("params");
-        let cert = params.self_signed(&key).expect("self-signed");
-        let der = cert.der().to_owned();
+        let der = crate::test_util::test_cert("cn").3;
         assert_eq!(fingerprint_hex(&der), fingerprint_hex(&der));
     }
 
     #[test]
     fn load_identity_rejects_pem_missing_key() {
         // A cert-only PEM has no private key.
-        let key = rcgen::KeyPair::generate().expect("generate key");
-        let params = rcgen::CertificateParams::new(vec!["cn".into()]).expect("params");
-        let cert = params.self_signed(&key).expect("self-signed");
-        let err = load_identity(&cert.pem()).err().expect("must error");
+        let (_, cert_pem, ..) = crate::test_util::test_cert("cn");
+        let err = load_identity(&cert_pem).err().expect("must error");
         assert!(err.to_string().contains("private key"), "unexpected: {err}");
     }
 
     #[test]
     fn load_identity_rejects_pem_missing_cert() {
-        let key = rcgen::KeyPair::generate().expect("generate key");
-        let err = load_identity(&key.serialize_pem())
-            .err()
-            .expect("must error");
+        let (_, _, key_pem, _) = crate::test_util::test_cert("cn");
+        let err = load_identity(&key_pem).err().expect("must error");
         assert!(err.to_string().contains("certificate"), "unexpected: {err}");
     }
 

@@ -73,19 +73,17 @@ impl Message {
             .ok_or_else(|| ProtocolError::Invalid("empty payload".into()))?;
         match kind {
             KIND_ANNOUNCE => decode_announce(rest).map(Message::Announce),
-            KIND_PING => {
-                if rest.is_empty() {
-                    Ok(Message::Ping)
-                } else {
-                    Err(ProtocolError::Invalid("ping with trailing bytes".into()))
+            KIND_PING | KIND_PONG => {
+                if !rest.is_empty() {
+                    return Err(ProtocolError::Invalid(
+                        "trailing bytes after control frame".into(),
+                    ));
                 }
-            }
-            KIND_PONG => {
-                if rest.is_empty() {
-                    Ok(Message::Pong)
+                Ok(if kind == KIND_PING {
+                    Message::Ping
                 } else {
-                    Err(ProtocolError::Invalid("pong with trailing bytes".into()))
-                }
+                    Message::Pong
+                })
             }
             _ => Err(ProtocolError::UnknownKind(kind)),
         }
@@ -125,16 +123,16 @@ fn decode_announce(rest: &[u8]) -> Result<ClipboardItem, ProtocolError> {
     let err = |m: &str| ProtocolError::Invalid(m.to_string());
     let mut cursor = Cursor::new(rest);
 
-    let origin_arr = cursor.take_arr8()?;
-    let serial = u64::from_be_bytes(cursor.take_arr8()?);
-    let n_mimes = u16::from_be_bytes(cursor.take_arr2()?) as usize;
+    let origin_arr = cursor.take_arr::<8>()?;
+    let serial = u64::from_be_bytes(cursor.take_arr::<8>()?);
+    let n_mimes = u16::from_be_bytes(cursor.take_arr::<2>()?) as usize;
 
     let mut reps = Vec::with_capacity(n_mimes);
     for _ in 0..n_mimes {
-        let mime_len = u16::from_be_bytes(cursor.take_arr2()?) as usize;
+        let mime_len = u16::from_be_bytes(cursor.take_arr::<2>()?) as usize;
         let mime = cursor.take(mime_len)?;
         let mime = String::from_utf8(mime.to_vec()).map_err(|_| err("mime not utf-8"))?;
-        let data_len = u32::from_be_bytes(cursor.take_arr4()?) as usize;
+        let data_len = u32::from_be_bytes(cursor.take_arr::<4>()?) as usize;
         let data = cursor.take(data_len)?.to_vec();
         reps.push((mime, data));
     }
@@ -161,20 +159,9 @@ impl<'a> Cursor<'a> {
         Self { buf, pos: 0 }
     }
 
-    fn take_arr2(&mut self) -> Result<[u8; 2], ProtocolError> {
-        let b = self.take(2)?;
-        Ok([b[0], b[1]])
-    }
-
-    fn take_arr4(&mut self) -> Result<[u8; 4], ProtocolError> {
-        let b = self.take(4)?;
-        Ok([b[0], b[1], b[2], b[3]])
-    }
-
-    fn take_arr8(&mut self) -> Result<[u8; 8], ProtocolError> {
-        let b = self.take(8)?;
-        let mut out = [0u8; 8];
-        out.copy_from_slice(b);
+    fn take_arr<const N: usize>(&mut self) -> Result<[u8; N], ProtocolError> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.take(N)?);
         Ok(out)
     }
 
@@ -258,6 +245,7 @@ impl FrameReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::Rng;
 
     fn sample_item() -> ClipboardItem {
         ClipboardItem {
@@ -373,25 +361,6 @@ mod tests {
     }
 
     // ---- deterministic PRNG for randomized tests (no external deps) ----
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-        }
-        fn next(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x
-        }
-        fn range(&mut self, hi: usize) -> usize {
-            (self.next() % hi.max(1) as u64) as usize
-        }
-    }
 
     fn random_item(rng: &mut Rng) -> ClipboardItem {
         let mut reps = Vec::new();

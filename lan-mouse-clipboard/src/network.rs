@@ -16,8 +16,6 @@ use crate::protocol::{FrameReader, KIND_PING, KIND_PONG, Message};
 use crate::registry::{ConnKind, ConnectionRegistry};
 use crate::transport::{ClientConfig, ClientStream, ServerStream, TlsListener, connect};
 
-pub struct NetworkError;
-
 /// Events the network task raises for the owning service. Both a new
 /// connection and a failed health check mean the peer's live address should
 /// be re-derived, so they collapse into a single `Retrain`.
@@ -72,6 +70,10 @@ pub struct NetworkLimits {
     pub idle_timeout: Duration,
 }
 
+/// Outcome of a background dial: the address, its peer id, and the stream if
+/// the connect succeeded.
+type ConnResult = (SocketAddr, String, Option<ClientStream>);
+
 /// Internal signals from a per-peer read loop back to the network loop.
 enum HealthEvent {
     /// A ping arrived (from `addr`); reply with a pong.
@@ -121,25 +123,17 @@ pub async fn run_clipboard_server(
     let mut registry = ConnectionRegistry::new(idle_timeout);
     // Channel from background connect-tasks back to this loop. Carries the
     // peer id so a failed dial can rotate that peer to its next fallback.
-    let (conn_tx, mut conn_rx) = mpsc::channel::<(SocketAddr, String, Option<ClientStream>)>(16);
+    let (conn_tx, mut conn_rx) = mpsc::channel::<ConnResult>(16);
     // Channel from per-peer read loops reporting that a connection died, so
     // we can drop it from the registry and the `connected` set and let the
     // fallback reconnect re-establish it.
     let (disc_tx, mut disc_rx) = mpsc::channel::<SocketAddr>(16);
     // Channel from per-peer read loops for health frames (ping/pong).
     let (health_tx, mut health_rx) = mpsc::channel::<HealthEvent>(64);
-    // Peer target addresses we already have a live outgoing channel to.
-    let mut connected: HashSet<SocketAddr> = HashSet::new();
-    // Addresses with a connect attempt currently in flight.
-    let mut connecting: HashSet<SocketAddr> = HashSet::new();
     // Last seen pong per live channel, keyed by connection address.
     let mut last_seen: HashMap<SocketAddr, Instant> = HashMap::new();
-    // Current peer set (from the service), used by the fallback reconnect.
-    let mut peers_now: Vec<PeerEndpoints> = peers.borrow().clone();
-    // Endpoint currently being used per peer (its active address, or a
-    // fallback after the active one failed).
-    let mut peer_current: HashMap<String, SocketAddr> =
-        peers_now.iter().map(|p| (p.id.clone(), p.active)).collect();
+    // Outgoing-connection bookkeeping (peer set, live/dialing endpoints).
+    let mut dial = DialState::new(peers.borrow().clone());
 
     let mut health = tokio::time::interval(HEALTH_INTERVAL);
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -165,14 +159,7 @@ pub async fn run_clipboard_server(
     });
 
     // Establish connections for the peers known at startup.
-    spawn_connections(
-        &client_config,
-        &peers_now,
-        &peer_current,
-        &connected,
-        &mut connecting,
-        &conn_tx,
-    );
+    dial.spawn(&client_config, &conn_tx);
 
     loop {
         tokio::select! {
@@ -195,77 +182,35 @@ pub async fn run_clipboard_server(
                 }
                 for addr in &dead {
                     log::warn!("clipboard health check failed for {addr}; dropping and retraining");
-                    registry.remove(addr);
-                    connected.remove(addr);
-                    last_seen.remove(addr);
-                    advance_peer(&mut peer_current, &peers_now, *addr);
+                    dial.forget(&mut registry, &mut last_seen, addr);
+                    dial.advance(*addr);
                 }
                 if !dead.is_empty() {
                     // Backstop: retrain the IPs, then burst reconnect.
                     let _ = event_tx.try_send(NetworkEvent::Retrain);
-                    spawn_connections(
-                        &client_config,
-                        &peers_now,
-                        &peer_current,
-                        &connected,
-                        &mut connecting,
-                        &conn_tx,
-                    );
+                    dial.spawn(&client_config, &conn_tx);
                 }
             }
             _ = retry.tick() => {
                 // Fallback reconnect only while some known peer has no live
                 // endpoint; a healthy, fully-connected set does nothing.
-                if peers_now
-                    .iter()
-                    .any(|p| !p.all().iter().any(|a| connected.contains(a)))
-                {
-                    spawn_connections(
-                        &client_config,
-                        &peers_now,
-                        &peer_current,
-                        &connected,
-                        &mut connecting,
-                        &conn_tx,
-                    );
+                if dial.any_missing() {
+                    dial.spawn(&client_config, &conn_tx);
                 }
             }
             changed = peers.changed() => {
                 if changed.is_ok() {
-                    peers_now = peers.borrow_and_update().clone();
-                    log::debug!("clipboard peer set updated: {peers_now:?}");
-                    // Prefer the (possibly re-trained) active endpoint again,
-                    // but only for peers that have no live channel; otherwise
-                    // a healthy fallback connection would be pruned and
-                    // re-dialed on every retrain.
-                    for p in &peers_now {
-                        let has_live = p.all().iter().any(|a| connected.contains(a));
-                        if !has_live {
-                            peer_current.insert(p.id.clone(), p.active);
-                        }
-                    }
-                    // Prune any channel that is no longer the one live
-                    // endpoint for its peer, then top up connections.
-                    prune_channels(
-                        &mut registry,
-                        &mut connected,
-                        &mut last_seen,
-                        &peers_now,
-                        &peer_current,
-                    );
-                    spawn_connections(
-                        &client_config,
-                        &peers_now,
-                        &peer_current,
-                        &connected,
-                        &mut connecting,
-                        &conn_tx,
-                    );
+                    dial.set_peers(peers.borrow_and_update().clone());
+                    log::debug!("clipboard peer set updated: {:?}", dial.peers);
+                    // Prune any channel that is no longer its peer's live
+                    // endpoint, then top up connections.
+                    dial.prune(&mut registry, &mut last_seen);
+                    dial.spawn(&client_config, &conn_tx);
                 }
             }
             established = conn_rx.recv() => {
                 if let Some((addr, peer_id, stream)) = established {
-                    connecting.remove(&addr);
+                    dial.dialing.remove(&addr);
                     match stream {
                         Some(stream) => {
                             if registry.contains(&addr) {
@@ -274,13 +219,10 @@ pub async fn run_clipboard_server(
                             log::info!("clipboard connected to peer {addr}");
                             let (r, w) = tokio::io::split(stream);
                             registry.insert(addr, Box::new(w), ConnKind::Outgoing);
-                            connected.insert(addr);
+                            dial.live.insert(addr);
                             last_seen.insert(addr, Instant::now());
-                            peer_current.insert(peer_id, addr);
-                            let tx = inbound_tx.clone();
-                            let dtx = disc_tx.clone();
-                            let htx = health_tx.clone();
-                            tokio::spawn(read_loop(r, addr, tx, dtx, htx, max_payload));
+                            dial.current.insert(peer_id, addr);
+                            spawn_read_loop(r, addr, &inbound_tx, &disc_tx, &health_tx, max_payload);
                             // Retrain IPs on every connect so peers converge
                             // on the live address.
                             let _ = event_tx.try_send(NetworkEvent::Retrain);
@@ -288,7 +230,7 @@ pub async fn run_clipboard_server(
                         None => {
                             // Dial failed: rotate this peer to its next
                             // registered fallback.
-                            advance_peer(&mut peer_current, &peers_now, addr);
+                            dial.advance(addr);
                         }
                     }
                 }
@@ -302,8 +244,7 @@ pub async fn run_clipboard_server(
                     if !registry.write_to(&addr, &pong).await {
                         // Keep the bookkeeping consistent with the registry,
                         // which `write_to` just pruned on the failed write.
-                        connected.remove(&addr);
-                        last_seen.remove(&addr);
+                        dial.forget(&mut registry, &mut last_seen, &addr);
                     }
                 }
                 None => {}
@@ -312,10 +253,8 @@ pub async fn run_clipboard_server(
                 if let Some(addr) = disconnected {
                     // Peer closed its side. Drop the stale channel and clear the
                     // "connected" marker; the fallback reconnect re-establishes it.
-                    registry.remove(&addr);
-                    connected.remove(&addr);
-                    last_seen.remove(&addr);
-                    advance_peer(&mut peer_current, &peers_now, addr);
+                    dial.forget(&mut registry, &mut last_seen, &addr);
+                    dial.advance(addr);
                     log::info!("clipboard peer {addr} removed, will reconnect");
                 }
             }
@@ -324,8 +263,7 @@ pub async fn run_clipboard_server(
                     let (_delivered, removed) = registry.broadcast(&frame).await;
                     let evicted = registry.evict_idle();
                     for addr in removed.into_iter().chain(evicted) {
-                        connected.remove(&addr);
-                        last_seen.remove(&addr);
+                        dial.forget(&mut registry, &mut last_seen, &addr);
                     }
                 }
                 None => break,
@@ -342,10 +280,7 @@ pub async fn run_clipboard_server(
                     let (r, w) = tokio::io::split(stream);
                     registry.insert(addr, Box::new(w), ConnKind::Incoming);
                     last_seen.insert(addr, Instant::now());
-                    let tx = inbound_tx.clone();
-                    let dtx = disc_tx.clone();
-                    let htx = health_tx.clone();
-                    tokio::spawn(read_loop(r, addr, tx, dtx, htx, max_payload));
+                    spawn_read_loop(r, addr, &inbound_tx, &disc_tx, &health_tx, max_payload);
                     let _ = event_tx.try_send(NetworkEvent::Retrain);
                 }
             }
@@ -353,110 +288,168 @@ pub async fn run_clipboard_server(
     }
 }
 
-/// Spawn a background connect task per configured peer that we do not
-/// already have a live outgoing channel to and are not already dialing.
-///
-/// Connect attempts never block the accept loop (which would deadlock two
-/// peers connecting to each other), so the listener stays available. The
-/// `connecting` set guards against duplicate concurrent dials to the same
-/// address (the registry is keyed by peer address, so a duplicate would let
-/// one connection's teardown evict the other).
-fn spawn_connections(
-    client_config: &ClientConfig,
-    peers: &[PeerEndpoints],
-    peer_current: &HashMap<String, SocketAddr>,
-    connected: &HashSet<SocketAddr>,
-    connecting: &mut HashSet<SocketAddr>,
-    conn_tx: &mpsc::Sender<(SocketAddr, String, Option<ClientStream>)>,
-) {
-    for peer in peers {
-        // One channel per peer: skip if any of its endpoints is already live
-        // or being dialed.
-        if peer
-            .all()
-            .iter()
-            .any(|a| connected.contains(a) || connecting.contains(a))
-        {
-            continue;
-        }
-        let addr = peer_current.get(&peer.id).copied().unwrap_or(peer.active);
-        connecting.insert(addr);
-        let cfg = client_config.clone();
-        let tx = conn_tx.clone();
-        let id = peer.id.clone();
-        tokio::spawn(async move {
-            let stream = match connect(addr, cfg).await {
-                Ok(stream) => Some(stream),
-                Err(e) => {
-                    log::debug!("clipboard connect to {addr} failed: {e}");
-                    None
-                }
-            };
-            let _ = tx.send((addr, id, stream)).await;
-        });
-    }
-}
-
-/// Find the peer that owns `ip`.
-fn peer_of_ip(peers: &[PeerEndpoints], ip: IpAddr) -> Option<&PeerEndpoints> {
-    peers.iter().find(|p| p.contains_ip(ip))
-}
-
-/// After a channel to `addr` failed, advance that peer's current endpoint to
-/// its next fallback (if any) so the fallback reconnect tries the next IP.
-fn advance_peer(
-    peer_current: &mut HashMap<String, SocketAddr>,
-    peers: &[PeerEndpoints],
+/// Start the per-channel read loop, which feeds inbound frames, disconnect
+/// notifications, and health frames back to the server loop.
+fn spawn_read_loop<R>(
+    reader: ReadHalf<R>,
     addr: SocketAddr,
-) {
-    let Some(peer) = peer_of_ip(peers, addr.ip()) else {
-        return;
-    };
-    if peer_current.get(&peer.id).copied() == Some(addr) {
-        if let Some(next) = peer.next_after(addr) {
-            peer_current.insert(peer.id.clone(), next);
-        }
-    }
+    inbound_tx: &mpsc::Sender<Vec<u8>>,
+    disc_tx: &mpsc::Sender<SocketAddr>,
+    health_tx: &mpsc::Sender<HealthEvent>,
+    max_payload: usize,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(read_loop(
+        reader,
+        addr,
+        inbound_tx.clone(),
+        disc_tx.clone(),
+        health_tx.clone(),
+        max_payload,
+    ));
 }
 
-/// Reconcile live channels with the current peer set: keep only one outgoing
-/// channel per peer (the peer's currently used endpoint), drop outgoing
-/// channels whose IP is no longer a known endpoint, and collapse duplicate
-/// incoming channels from the same peer IP.
-fn prune_channels(
-    registry: &mut ConnectionRegistry,
-    connected: &mut HashSet<SocketAddr>,
-    last_seen: &mut HashMap<SocketAddr, Instant>,
-    peers: &[PeerEndpoints],
-    peer_current: &HashMap<String, SocketAddr>,
-) {
-    let mut seen_incoming: HashSet<IpAddr> = HashSet::new();
-    let mut to_drop = Vec::new();
-    for (addr, kind) in registry.entries() {
-        match kind {
-            ConnKind::Outgoing => {
-                let Some(peer) = peer_of_ip(peers, addr.ip()) else {
-                    to_drop.push(addr);
-                    continue;
-                };
-                let current = peer_current.get(&peer.id).copied().unwrap_or(peer.active);
-                if addr != current {
-                    to_drop.push(addr);
-                }
+/// Outgoing-connection bookkeeping: the peer set, the endpoint each peer is
+/// currently using, and which endpoints are live or being dialed.
+struct DialState {
+    /// Peer set as last published by the service.
+    peers: Vec<PeerEndpoints>,
+    /// Endpoint currently dialed/used per peer id.
+    current: HashMap<String, SocketAddr>,
+    /// Endpoints with a live channel.
+    live: HashSet<SocketAddr>,
+    /// Endpoints with a connect attempt in flight.
+    dialing: HashSet<SocketAddr>,
+}
+
+impl DialState {
+    fn new(peers: Vec<PeerEndpoints>) -> Self {
+        let current = peers.iter().map(|p| (p.id.clone(), p.active)).collect();
+        Self {
+            peers,
+            current,
+            live: HashSet::new(),
+            dialing: HashSet::new(),
+        }
+    }
+
+    fn has_live(&self, peer: &PeerEndpoints) -> bool {
+        peer.all().iter().any(|a| self.live.contains(a))
+    }
+
+    /// Adopt a new peer set. A peer without a live channel prefers its
+    /// (possibly re-trained) active endpoint again; a peer that already has a
+    /// healthy channel keeps it, so a retrain does not prune and re-dial a
+    /// working fallback connection.
+    fn set_peers(&mut self, peers: Vec<PeerEndpoints>) {
+        for p in &peers {
+            if !self.has_live(p) {
+                self.current.insert(p.id.clone(), p.active);
             }
-            ConnKind::Incoming => {
-                // At most one incoming channel per peer IP.
-                if !seen_incoming.insert(addr.ip()) {
-                    to_drop.push(addr);
-                }
+        }
+        self.peers = peers;
+    }
+
+    /// Whether some known peer has no live endpoint.
+    fn any_missing(&self) -> bool {
+        self.peers.iter().any(|p| !self.has_live(p))
+    }
+
+    /// Spawn a connect task for every peer without a live or in-flight
+    /// endpoint. Dials never block the accept loop (which would deadlock two
+    /// peers dialing each other), and `dialing` guards against duplicate
+    /// concurrent dials to the same address.
+    fn spawn(&mut self, client_config: &ClientConfig, conn_tx: &mpsc::Sender<ConnResult>) {
+        let mut to_dial = Vec::new();
+        for peer in &self.peers {
+            if peer
+                .all()
+                .iter()
+                .any(|a| self.live.contains(a) || self.dialing.contains(a))
+            {
+                continue;
+            }
+            let addr = self.current.get(&peer.id).copied().unwrap_or(peer.active);
+            to_dial.push((peer.id.clone(), addr));
+        }
+        for (id, addr) in to_dial {
+            self.dialing.insert(addr);
+            let cfg = client_config.clone();
+            let tx = conn_tx.clone();
+            tokio::spawn(async move {
+                let stream = match connect(addr, cfg).await {
+                    Ok(stream) => Some(stream),
+                    Err(e) => {
+                        log::debug!("clipboard connect to {addr} failed: {e}");
+                        None
+                    }
+                };
+                let _ = tx.send((addr, id, stream)).await;
+            });
+        }
+    }
+
+    /// After a channel to `addr` failed, advance its peer to the next
+    /// fallback (if any) so the next dial tries a different address.
+    fn advance(&mut self, addr: SocketAddr) {
+        let Some(peer) = self.peers.iter().find(|p| p.contains_ip(addr.ip())) else {
+            return;
+        };
+        if self.current.get(&peer.id).copied() == Some(addr) {
+            if let Some(next) = peer.next_after(addr) {
+                self.current.insert(peer.id.clone(), next);
             }
         }
     }
-    for addr in to_drop {
-        log::debug!("clipboard pruning redundant/stale channel {addr}");
-        registry.remove(&addr);
-        connected.remove(&addr);
-        last_seen.remove(&addr);
+
+    /// Forget a channel everywhere it is tracked: registry, live set, and
+    /// health map. Removals are idempotent.
+    fn forget(
+        &mut self,
+        registry: &mut ConnectionRegistry,
+        last_seen: &mut HashMap<SocketAddr, Instant>,
+        addr: &SocketAddr,
+    ) {
+        registry.remove(addr);
+        self.live.remove(addr);
+        last_seen.remove(addr);
+    }
+
+    /// Keep only one channel per peer: drop outgoing channels that are no
+    /// longer the peer's current endpoint (or whose IP is no longer a known
+    /// endpoint) and duplicate incoming channels from one IP.
+    fn prune(
+        &mut self,
+        registry: &mut ConnectionRegistry,
+        last_seen: &mut HashMap<SocketAddr, Instant>,
+    ) {
+        let mut seen_incoming: HashSet<IpAddr> = HashSet::new();
+        let mut to_drop = Vec::new();
+        for (addr, kind) in registry.entries() {
+            match kind {
+                ConnKind::Outgoing => {
+                    let current = self
+                        .peers
+                        .iter()
+                        .find(|p| p.contains_ip(addr.ip()))
+                        .map(|p| self.current.get(&p.id).copied().unwrap_or(p.active));
+                    if current != Some(addr) {
+                        to_drop.push(addr);
+                    }
+                }
+                ConnKind::Incoming => {
+                    // At most one incoming channel per peer IP.
+                    if !seen_incoming.insert(addr.ip()) {
+                        to_drop.push(addr);
+                    }
+                }
+            }
+        }
+        for addr in to_drop {
+            log::debug!("clipboard pruning redundant/stale channel {addr}");
+            self.forget(registry, last_seen, &addr);
+        }
     }
 }
 
@@ -531,11 +524,8 @@ mod tests {
     }
 
     fn test_identity(cn: &str) -> TestIdentity {
-        let key = rcgen::KeyPair::generate().expect("key");
-        let params = rcgen::CertificateParams::new(vec![cn.to_string()]).expect("params");
-        let cert = params.self_signed(&key).expect("cert");
-        let pem = format!("{}{}", cert.pem(), key.serialize_pem());
-        let identity = crate::transport::load_identity(&pem).expect("identity");
+        let identity =
+            crate::transport::load_identity(&crate::test_util::identity_pem(cn)).expect("identity");
         let fingerprint = identity.fingerprint();
         TestIdentity {
             identity,
