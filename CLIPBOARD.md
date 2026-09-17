@@ -211,8 +211,26 @@ The wire format is MIME-agnostic, so images (and any other binary content)
 travel the same way as text: each representation is just a MIME type and its
 bytes. A local selection can offer several types at once (a browser image
 offers `image/png` alongside `text/html` and `text/plain`); the reading
-backend collects every transferable type, in the order the selection lists
-them, and the wire carries the whole ordered list.
+backend collects the useful ones, in the order the selection lists them, and
+the wire carries the resulting ordered list.
+
+Reads are deliberately limited. Reading a type forces the clipboard owner to
+produce it on demand, and some owners - Qt in particular - advertise a large
+converter matrix (every image format their encoders support, e.g. `image/heic`,
+`image/eps`, `image/exr`, `image/jxl`, plus `application/x-qt-image`). Asking
+for all of them makes the owner re-encode the image dozens of times on its UI
+thread, which can stall the application that owns the clipboard. Instead the
+backend reads:
+
+- **all text types** (`text/*`, plus the legacy X11 string targets); and
+- **one image type**: the best-ranked format offered, by preference
+  `image/png` > `image/webp` > `image/jpeg`/`image/jpg` > `image/bmp` >
+  `image/tiff` > any other `image/*`.
+
+Format aliases are collapsed (`image/jpg`/`image/jfif` -> `image/jpeg`,
+`image/tif` -> `image/tiff`), and private types such as
+`application/x-qt-image` are never read. Keeping the offered relative order
+means the sender's own preference still decides the primary representation.
 
 The **first representation is the primary**. It matters because a receiving
 backend can usually advertise only one MIME type at a time (`wl-copy` sets a
@@ -221,7 +239,7 @@ drops the rest:
 
 - The primary is chosen by the *sender*, following the order the selection
   itself reports. `wl-paste --list-types` is the authority, so the source
-  application's own preference wins.
+  application's own preference wins among the types we read.
 - Protocol targets that are not data (`TARGETS`, `MULTIPLE`, `TIMESTAMP`,
   `SAVE_TARGETS`, ...) are filtered out, as are the legacy X11 string aliases
   (`UTF8_STRING`, `STRING`, `TEXT`) whenever at least one real MIME type is
@@ -410,7 +428,7 @@ Backends are selected through `BackendKind`:
 | Kind         | Role        | Notes                                                        |
 |--------------|-------------|--------------------------------------------------------------|
 | `auto`       | (resolved)  | Picks the best available candidate automatically.            |
-| `wl-clipboard`| source+sink | Shells out to `wl-paste` / `wl-copy`; covers Noctalia v5 and similar. Reads every offered MIME type (text and images); writes the primary representation. |
+| `wl-clipboard`| source+sink | Shells out to `wl-paste` / `wl-copy`; covers Noctalia v5 and similar. Reads supported text/image types (skips expensive converter formats); writes the primary representation. |
 | `cliphist`   | sink only   | Pipes received items into `cliphist store` to record history; never a change source. Stores the primary representation's MIME. |
 | `klipper`    | source+sink | KDE clipboard via DBus (`dbus-send`). Text only; rich items are skipped. |
 | `dbus`       | source+sink | Generic DBus clipboard integration. Text only.              |
