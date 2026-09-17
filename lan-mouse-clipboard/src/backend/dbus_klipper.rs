@@ -7,7 +7,6 @@
 //! unavailable.
 
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::Stream;
@@ -21,22 +20,50 @@ const SERVICE: &str = "org.kde.klipper";
 const PATH: &str = "/klipper";
 const IFACE: &str = "org.kde.klipper.klipper";
 
-/// A shared DBus-backed clipboard, parameterized by its display name.
+/// How often the clipboard is polled for changes.
+const POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// A DBus-backed clipboard, parameterized by its display name.
 pub struct DbusClipboardBackend {
     name: &'static str,
-    current: Mutex<Option<String>>,
 }
 
 impl DbusClipboardBackend {
     pub fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            current: Mutex::new(None),
-        }
+        Self { name }
     }
 
     pub fn available() -> bool {
         which("dbus-send")
+    }
+}
+
+/// Build a `dbus-send --session --print-reply` call to one klipper method.
+fn dbus_send(method: &str) -> Command {
+    let mut cmd = Command::new("dbus-send");
+    cmd.arg("--session")
+        .arg("--print-reply")
+        .arg(format!("--dest={SERVICE}"))
+        .arg(PATH)
+        .arg(format!("{IFACE}.{method}"));
+    cmd
+}
+
+/// Read the current clipboard text over DBus, if the service answers.
+async fn read_dbus_text() -> Option<String> {
+    let out = dbus_send("getClipboardContents").output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_dbus_string(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Wrap plain text as the item this backend produces.
+fn text_item(text: String) -> ClipboardItem {
+    ClipboardItem {
+        origin: [0; 8],
+        serial: 0,
+        reps: vec![(MIME_TEXT_PLAIN.to_string(), text.into_bytes())],
     }
 }
 
@@ -47,25 +74,7 @@ impl ClipboardBackend for DbusClipboardBackend {
     }
 
     async fn read_current(&self) -> Option<ClipboardItem> {
-        let args = vec![
-            "--session".to_string(),
-            "--print-reply".to_string(),
-            format!("--dest={SERVICE}"),
-            PATH.to_string(),
-            format!("{IFACE}.getClipboardContents"),
-        ];
-        let out = Command::new("dbus-send").args(&args).output().await.ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let text = parse_dbus_string(&stdout)?;
-        *self.current.lock().expect("lock") = Some(text.clone());
-        Some(ClipboardItem {
-            origin: [0; 8],
-            serial: 0,
-            reps: vec![(MIME_TEXT_PLAIN.to_string(), text.into_bytes())],
-        })
+        Some(text_item(read_dbus_text().await?))
     }
 
     async fn set(&self, item: &ClipboardItem) -> Result<(), BackendError> {
@@ -83,15 +92,10 @@ impl ClipboardBackend for DbusClipboardBackend {
             return Ok(());
         }
         let text = String::from_utf8_lossy(data).into_owned();
-        let args = vec![
-            "--session".to_string(),
-            "--print-reply".to_string(),
-            format!("--dest={SERVICE}"),
-            PATH.to_string(),
-            format!("{IFACE}.setClipboardContents"),
-            format!("string:{text}"),
-        ];
-        let status = Command::new("dbus-send").args(&args).status().await?;
+        let status = dbus_send("setClipboardContents")
+            .arg(format!("string:{text}"))
+            .status()
+            .await?;
         if !status.success() {
             return Err(BackendError::Other(format!("dbus-send failed: {status}")));
         }
@@ -100,20 +104,25 @@ impl ClipboardBackend for DbusClipboardBackend {
 
     async fn watch(&self) -> Pin<Box<dyn Stream<Item = ClipboardChange> + Send>> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let backend = DbusClipboardBackend::new(self.name);
         tokio::spawn(async move {
+            // Last text reported to the driver; the first successful read
+            // establishes the baseline and is emitted, later reads only when
+            // the value changes (DBus has no change signal we rely on).
+            let mut reported: Option<String> = None;
             loop {
-                if let Some(item) = backend.read_current().await {
-                    let same = backend.current.lock().expect("lock").as_ref()
-                        == item.text_plain().as_ref();
-                    if !same {
-                        *backend.current.lock().expect("lock") = item.text_plain();
-                        if tx.send(ClipboardChange::New(item)).await.is_err() {
+                if let Some(text) = read_dbus_text().await {
+                    if reported.as_deref() != Some(text.as_str()) {
+                        reported = Some(text.clone());
+                        if tx
+                            .send(ClipboardChange::New(text_item(text)))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
         });
         Box::pin(ReceiverStream::new(rx))
