@@ -87,7 +87,7 @@ async fn wl_clipboard_roundtrips_an_image_primary_rep() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // PATH lock must span the whole test
-async fn wl_clipboard_reads_all_offered_mime_reps_in_order() {
+async fn wl_clipboard_reads_supported_mime_reps_in_order() {
     let _guard = path_lock();
     let env = StubEnv::new(&[("wl-paste", WL_PASTE_STUB), ("wl-copy", WL_COPY_STUB)]);
     let backend = WlClipboardBackend::new(64 * 1024 * 1024);
