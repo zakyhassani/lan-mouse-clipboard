@@ -105,6 +105,11 @@ impl StubEnv {
     pub fn read_dbus(&self) -> Vec<u8> {
         fs::read(&self.dbus_file).unwrap_or_default()
     }
+
+    /// Simulate the klipper clipboard holding `text`.
+    pub fn write_dbus(&self, text: &str) {
+        fs::write(&self.dbus_file, text).expect("dbus write");
+    }
 }
 
 impl Drop for StubEnv {

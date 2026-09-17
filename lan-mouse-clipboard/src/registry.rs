@@ -27,6 +27,21 @@ struct Entry {
     last_used: Instant,
 }
 
+/// Write `frame` to one entry, stamping it as used on success. Logs and
+/// returns `false` on failure; the caller removes the entry.
+async fn write_entry(addr: SocketAddr, entry: &mut Entry, frame: &[u8]) -> bool {
+    match entry.sink.write_all(frame).await {
+        Ok(()) => {
+            entry.last_used = Instant::now();
+            true
+        }
+        Err(e) => {
+            log::warn!("clipboard send to {addr} failed: {e}");
+            false
+        }
+    }
+}
+
 /// Registry of live clipboard connections.
 pub struct ConnectionRegistry {
     peers: HashMap<SocketAddr, Entry>,
@@ -61,10 +76,6 @@ impl ConnectionRegistry {
         self.peers.contains_key(addr)
     }
 
-    pub fn len(&self) -> usize {
-        self.peers.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }
@@ -85,17 +96,11 @@ impl ConnectionRegistry {
         let Some(entry) = self.peers.get_mut(addr) else {
             return false;
         };
-        match entry.sink.write_all(frame).await {
-            Ok(()) => {
-                entry.last_used = Instant::now();
-                true
-            }
-            Err(e) => {
-                log::warn!("clipboard control write to {addr} failed: {e}");
-                self.peers.remove(addr);
-                false
-            }
+        if write_entry(*addr, entry, frame).await {
+            return true;
         }
+        self.peers.remove(addr);
+        false
     }
 
     /// Broadcast an encoded frame to every live connection.
@@ -107,15 +112,10 @@ impl ConnectionRegistry {
         let mut to_remove = Vec::new();
         let mut delivered = 0;
         for (addr, entry) in self.peers.iter_mut() {
-            match entry.sink.write_all(frame).await {
-                Ok(()) => {
-                    delivered += 1;
-                    entry.last_used = Instant::now();
-                }
-                Err(e) => {
-                    log::warn!("clipboard send to {addr} failed: {e}");
-                    to_remove.push(*addr);
-                }
+            if write_entry(*addr, entry, frame).await {
+                delivered += 1;
+            } else {
+                to_remove.push(*addr);
             }
         }
         for addr in &to_remove {
@@ -139,11 +139,6 @@ impl ConnectionRegistry {
             keep
         });
         evicted
-    }
-
-    /// Remove all connections (used on shutdown).
-    pub fn clear(&mut self) {
-        self.peers.clear();
     }
 }
 

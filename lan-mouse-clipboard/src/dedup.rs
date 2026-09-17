@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use crate::item::{ClipboardItem, origin_from_fingerprint, rep_hash};
+use crate::item::{ClipboardItem, rep_hash};
 
 /// How many recently-sent representation hashes to remember.
 const SENT_HISTORY: usize = 128;
@@ -41,15 +41,6 @@ impl LoopPrevention {
             pending_suppress: None,
             sent_rep_hashes: VecDeque::new(),
         }
-    }
-
-    pub fn origin(&self) -> [u8; 8] {
-        self.self_origin
-    }
-
-    /// Convenience: build from a local certificate fingerprint.
-    pub fn from_fingerprint(fingerprint: &str) -> Self {
-        Self::new(origin_from_fingerprint(fingerprint))
     }
 
     /// Allocate the next serial for a locally-originated item.
@@ -108,12 +99,6 @@ impl LoopPrevention {
         true
     }
 
-    /// Record that we broadcast a locally-originated item (tracks its hash
-    /// for dedup against future remote echoes).
-    pub fn note_broadcast(&mut self, item: &ClipboardItem) {
-        self.note_sent(item);
-    }
-
     /// Record every representation of an item we just broadcast, so a peer
     /// echoing back a representation it could reproduce (typically the primary)
     /// is recognized and suppressed.
@@ -131,6 +116,7 @@ impl LoopPrevention {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::Rng;
 
     const A: [u8; 8] = [1; 8];
     const B: [u8; 8] = [2; 8];
@@ -179,7 +165,7 @@ mod tests {
         let mut lp = LoopPrevention::new(A);
         let local = ClipboardItem::text("mine", A, 1);
         assert!(lp.on_local_change(&local));
-        lp.note_broadcast(&local);
+        lp.note_sent(&local);
         // peer echoes the same content back
         let echo = remote_item(B, "mine", 1);
         assert!(!lp.should_apply_remote(&echo));
@@ -255,25 +241,6 @@ mod tests {
     }
 
     // ---- deterministic PRNG for randomized tests (no external deps) ----
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-        }
-        fn next(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x
-        }
-        fn bytes(&mut self, n: usize) -> Vec<u8> {
-            (0..n).map(|_| self.next() as u8).collect()
-        }
-    }
 
     #[test]
     fn random_content_is_applied_then_its_echo_is_suppressed() {

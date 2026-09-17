@@ -6,9 +6,8 @@
 //! executables that emulate the real tools' observable behavior against
 //! plain files. That makes the backends' set/read logic unit-testable.
 //!
-//! The DBus backend is exercised under its own feature in-module (see
-//! `src/backend/dbus_klipper.rs`), because `dbus`/`klipper` are not default
-//! features.
+//! The DBus backend is exercised under its own feature by
+//! `tests/dbus_stubs.rs`, because `dbus`/`klipper` are not default features.
 
 mod common;
 

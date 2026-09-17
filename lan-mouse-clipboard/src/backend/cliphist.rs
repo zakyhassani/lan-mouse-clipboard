@@ -5,10 +5,8 @@
 //! recorded into history; cliphist is never used as a change source.
 
 use std::pin::Pin;
-use std::process::Stdio;
 
 use futures::Stream;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use super::{BackendError, ClipboardBackend, which};
@@ -57,19 +55,11 @@ impl ClipboardBackend for ClipHistBackend {
             log::debug!("cliphist: skipping non-MIME representation {mime}");
             return Ok(());
         };
-        let mut child = Command::new("cliphist")
-            .arg("store")
-            .arg("--mime")
-            .arg(&mime)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(data).await?;
-            stdin.flush().await?;
-        }
-        let _ = child.wait().await?;
+        let mut cmd = Command::new("cliphist");
+        cmd.arg("store").arg("--mime").arg(&mime);
+        // cliphist is a best-effort history sink: a non-zero exit is not
+        // surfaced to the driver.
+        let _ = super::pipe_stdin(cmd, data).await?;
         Ok(())
     }
 
