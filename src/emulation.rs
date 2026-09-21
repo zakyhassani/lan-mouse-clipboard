@@ -53,6 +53,10 @@ pub(crate) enum EmulationEvent {
     EmulationEnabled,
     /// capture should be released
     ReleaseNotify,
+    /// the local cursor was warped to a seam side (either on being entered by
+    /// a peer or on resuming local control). The capture should briefly ignore
+    /// new starts so the warp cannot re-arm it and bounce control back.
+    Warped,
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -457,6 +461,9 @@ impl EmulationTask {
                             }
                         };
                         emulation.warp_to_edge(handle, side).await?;
+                        self.event_tx
+                            .send(EmulationEvent::Warped)
+                            .expect("channel closed");
                     },
                     ProxyRequest::LocalWarp(side) => {
                         let handle = match self.local_handle {
@@ -470,6 +477,9 @@ impl EmulationTask {
                             }
                         };
                         emulation.warp_to_edge(handle, side).await?;
+                        self.event_tx
+                            .send(EmulationEvent::Warped)
+                            .expect("channel closed");
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {

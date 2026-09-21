@@ -65,6 +65,9 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// ignore capture starts for a while (used after a programmatic pointer
+    /// warp so it cannot immediately re-arm the local capture)
+    Suppress(Duration),
 }
 
 impl Capture {
@@ -140,6 +143,12 @@ impl Capture {
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+    }
+
+    /// Ignore capture starts for `dur`. Called after a programmatic pointer
+    /// warp so the warped cursor cannot immediately re-arm the local capture.
+    pub(crate) fn suppress(&self, dur: Duration) {
+        let _ = self.request_tx.send(CaptureRequest::Suppress(dur));
     }
 }
 
@@ -233,6 +242,7 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        CaptureRequest::Suppress(_) => { /* no capture session */ }
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -326,6 +336,7 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
+                    CaptureRequest::Suppress(d) => capture.suppress(d),
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }

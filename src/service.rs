@@ -92,6 +92,11 @@ struct Incoming {
     pos: Position,
 }
 
+/// How long capture starts are ignored after a seam warp. Long enough to
+/// swallow the bounce caused by the warp landing on a capture strip, short
+/// enough that a deliberate crossing back is only barely delayed.
+const WARP_SUPPRESS: std::time::Duration = std::time::Duration::from_millis(300);
+
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
@@ -389,6 +394,12 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::Warped => {
+                // A seam warp just moved our cursor onto a capture edge. Ignore
+                // new capture starts briefly, otherwise the warp immediately
+                // re-arms the capture and control ping-pongs across the seam.
+                self.capture.suppress(WARP_SUPPRESS);
+            }
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
