@@ -75,6 +75,8 @@ impl Output {
 
 struct State {
     keymap: Option<(u32, OwnedFd, u32)>,
+    /// shared by all clients, so the keymap fd is sent once instead of once per client
+    keyboard: Option<Vk>,
     input_for_client: HashMap<EmulationHandle, VirtualInput>,
     seat: wl_seat::WlSeat,
     qh: QueueHandle<Self>,
@@ -118,6 +120,7 @@ impl WlrootsEmulation {
             last_flush_failed: false,
             state: State {
                 keymap: None,
+                keyboard: None,
                 input_for_client,
                 seat,
                 vpm,
@@ -197,14 +200,20 @@ impl State {
 
     fn add_client(&mut self, client: EmulationHandle) {
         let pointer: Vp = self.vpm.create_virtual_pointer(None, &self.qh, ());
-        let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
 
-        // TODO: use server side keymap
-        if let Some((format, fd, size)) = self.keymap.as_ref() {
-            keyboard.keymap(*format, fd.as_fd(), *size);
-        } else {
-            panic!("no keymap");
-        }
+        let keyboard = match self.keyboard.as_ref() {
+            Some(keyboard) => keyboard.clone(),
+            None => {
+                let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
+                // TODO: use server side keymap
+                let Some((format, fd, size)) = self.keymap.as_ref() else {
+                    panic!("no keymap");
+                };
+                keyboard.keymap(*format, fd.as_fd(), *size);
+                self.keyboard = Some(keyboard.clone());
+                keyboard
+            }
+        };
 
         let vinput = VirtualInput {
             pointer,
@@ -216,9 +225,9 @@ impl State {
     }
 
     fn destroy_client(&mut self, handle: EmulationHandle) {
+        // the shared keyboard outlives every client; keys are released by InputEmulation::destroy
         if let Some(input) = self.input_for_client.remove(&handle) {
             input.pointer.destroy();
-            input.keyboard.destroy();
         }
     }
 }
@@ -413,6 +422,7 @@ impl VirtualInput {
                     PointerEvent::Axis { time, axis, value } => {
                         let axis: Axis = (axis as u32).try_into()?;
                         self.pointer.axis(time, axis, value);
+                        self.pointer.axis_source(AxisSource::Continuous);
                         self.pointer.frame();
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
