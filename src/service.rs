@@ -394,11 +394,16 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
-            EmulationEvent::Warped => {
-                // A seam warp just moved our cursor onto a capture edge. Ignore
-                // new capture starts briefly, otherwise the warp immediately
-                // re-arms the capture and control ping-pongs across the seam.
-                self.capture.suppress(WARP_SUPPRESS);
+            EmulationEvent::Warped { suppress_capture } => {
+                // A peer-entry seam warp moved our cursor onto a capture edge.
+                // Briefly suppress new capture starts, otherwise the warp
+                // immediately re-arms the capture and control ping-pongs across
+                // the seam. Local-control warps must not suppress: the user is
+                // already pushing back across the seam and should get control
+                // handed back, not drive the local cursor.
+                if suppress_capture {
+                    self.capture.suppress(WARP_SUPPRESS);
+                }
             }
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });

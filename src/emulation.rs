@@ -54,9 +54,14 @@ pub(crate) enum EmulationEvent {
     /// capture should be released
     ReleaseNotify,
     /// the local cursor was warped to a seam side (either on being entered by
-    /// a peer or on resuming local control). The capture should briefly ignore
-    /// new starts so the warp cannot re-arm it and bounce control back.
-    Warped,
+    /// a peer or on resuming local control). `suppress_capture` is set for the
+    /// peer-entry warp: our own capture must briefly ignore new starts so that
+    /// warp cannot re-arm it and bounce control back. A local-control warp does
+    /// not suppress, otherwise a user pushing back across the seam would be
+    /// left driving the local cursor instead of handing control over.
+    Warped {
+        suppress_capture: bool,
+    },
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -462,7 +467,9 @@ impl EmulationTask {
                         };
                         emulation.warp_to_edge(handle, side).await?;
                         self.event_tx
-                            .send(EmulationEvent::Warped)
+                            .send(EmulationEvent::Warped {
+                                suppress_capture: true,
+                            })
                             .expect("channel closed");
                     },
                     ProxyRequest::LocalWarp(side) => {
@@ -478,7 +485,9 @@ impl EmulationTask {
                         };
                         emulation.warp_to_edge(handle, side).await?;
                         self.event_tx
-                            .send(EmulationEvent::Warped)
+                            .send(EmulationEvent::Warped {
+                                suppress_capture: false,
+                            })
                             .expect("channel closed");
                     },
                     ProxyRequest::Remove(addr) => {

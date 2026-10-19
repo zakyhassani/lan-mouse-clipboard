@@ -26,7 +26,7 @@ use wayland_protocols::{
             zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
         },
         pointer_constraints::zv1::client::{
-            zwp_locked_pointer_v1::ZwpLockedPointerV1,
+            zwp_locked_pointer_v1::{self, ZwpLockedPointerV1},
             zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1},
         },
         relative_pointer::zv1::client::{
@@ -117,7 +117,16 @@ struct State {
     active_positions: HashSet<Position>,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
+    connection: Connection,
     pointer_lock: Option<ZwpLockedPointerV1>,
+    pointer_locked: bool,
+    pointer_lock_requested: bool,
+    last_enter_serial: u32,
+    capturing: bool,
+    unlock_retries: u8,
+    cursor_surface: WlSurface,
+    #[allow(dead_code)]
+    cursor_buffer: wl_buffer::WlBuffer,
     rel_pointer: Option<ZwpRelativePointerV1>,
     shortcut_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     active_windows: Vec<Arc<Window>>,
@@ -166,9 +175,10 @@ impl Window {
         log::debug!("creating window output: {output:?}, size: {size:?}");
         let g = &state.globals;
 
+        const CAPTURE_STRIP_SIZE: u32 = 8;
         let (width, height) = match pos {
-            Position::Left | Position::Right => (1, size.1 as u32),
-            Position::Top | Position::Bottom => (size.0 as u32, 1),
+            Position::Left | Position::Right => (CAPTURE_STRIP_SIZE, size.1 as u32),
+            Position::Top | Position::Bottom => (size.0 as u32, CAPTURE_STRIP_SIZE),
         };
         let mut file = tempfile::tempfile().unwrap();
         draw(&mut file, (width, height));
@@ -315,6 +325,19 @@ impl LayerShellInputCapture {
         }
         let shortcut_inhibit_manager = shortcut_inhibit_manager.ok();
 
+        // Fully transparent cursor used while capturing. Some compositors
+        // restore their own cursor when a pointer constraint is deactivated;
+        // a real blank cursor surface is more reliable than set_cursor(None).
+        let mut cursor_file = tempfile::tempfile().unwrap();
+        cursor_file.write_all(&0u32.to_ne_bytes()).unwrap();
+        cursor_file.flush().unwrap();
+        let cursor_pool = shm.create_pool(cursor_file.as_fd(), 4, &qh, ());
+        let cursor_buffer =
+            cursor_pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, &qh, ());
+        let cursor_surface = compositor.create_surface(&qh, ());
+        cursor_surface.attach(Some(&cursor_buffer), 0, 0);
+        cursor_surface.commit();
+
         let mut state = State {
             active_positions: Default::default(),
             pointer: None,
@@ -330,7 +353,15 @@ impl LayerShellInputCapture {
                 shortcut_inhibit_manager,
                 xdg_output_manager,
             },
+            connection: conn,
             pointer_lock: None,
+            pointer_locked: false,
+            pointer_lock_requested: false,
+            last_enter_serial: 0,
+            capturing: false,
+            unlock_retries: 0,
+            cursor_surface,
+            cursor_buffer,
             rel_pointer: None,
             shortcut_inhibitor: None,
             active_windows: Vec::new(),
@@ -436,18 +467,22 @@ impl State {
         qh: &QueueHandle<State>,
     ) {
         let window = self.focused.as_ref().unwrap();
+        self.unlock_retries = 0;
 
-        // hide the cursor
-        pointer.set_cursor(serial, None, 0, 0);
+        // hide the cursor with a transparent cursor surface
+        pointer.set_cursor(serial, Some(&self.cursor_surface), 0, 0);
 
-        // capture input
-        window
-            .layer_surface
-            .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        window.surface.commit();
-
-        // lock pointer
-        if self.pointer_lock.is_none() {
+        // Lock the pointer before changing the layer surface state. The strip
+        // is thin, so the compositor must receive this request right away:
+        // leaving it queued until the end of the dispatch loop lets the cursor
+        // leave the strip first, and the compositor then unlocks immediately.
+        // A stale constraint may already be unlocked by the compositor, so
+        // request a fresh one unless this capture already holds the lock.
+        if !self.pointer_locked && !self.pointer_lock_requested {
+            if let Some(stale) = self.pointer_lock.take() {
+                stale.destroy();
+            }
+            log::debug!("requesting persistent pointer lock");
             self.pointer_lock = Some(self.globals.pointer_constraints.lock_pointer(
                 surface,
                 pointer,
@@ -456,7 +491,17 @@ impl State {
                 qh,
                 (),
             ));
+            self.pointer_lock_requested = true;
         }
+        if let Err(e) = self.connection.flush() {
+            log::warn!("failed to flush pointer lock request: {e}");
+        }
+
+        // capture input
+        window
+            .layer_surface
+            .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        window.surface.commit();
 
         // request relative input
         if self.rel_pointer.is_none() {
@@ -478,6 +523,7 @@ impl State {
                 ));
             }
         }
+        self.capturing = true;
     }
 
     fn ungrab(&mut self) {
@@ -498,6 +544,9 @@ impl State {
             pointer_lock.destroy();
             self.pointer_lock = None;
         }
+        self.pointer_locked = false;
+        self.pointer_lock_requested = false;
+        self.capturing = false;
 
         // destroy relative input
         if let Some(rel_pointer) = &self.rel_pointer {
@@ -736,6 +785,7 @@ impl Dispatch<WlPointer, ()> for State {
                 surface_x,
                 surface_y,
             } => {
+                app.last_enter_serial = serial;
                 // A programmatic seam warp can drop the cursor onto this strip
                 // and would otherwise immediately re-arm the capture, bouncing
                 // control back to the peer forever. Ignore the resulting Enter
@@ -1046,4 +1096,61 @@ delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
-delegate_noop!(State: ignore ZwpLockedPointerV1);
+impl Dispatch<ZwpLockedPointerV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwpLockedPointerV1,
+        event: zwp_locked_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_locked_pointer_v1::Event::Locked => {
+                log::debug!("pointer lock active");
+                state.pointer_locked = true;
+                state.pointer_lock_requested = false;
+            }
+            zwp_locked_pointer_v1::Event::Unlocked => {
+                log::debug!("pointer lock released by compositor");
+                state.pointer_locked = false;
+                state.pointer_lock_requested = false;
+                // Some compositors (Hyprland 0.56) deactivate pointer
+                // constraints when a layer surface state changes. Re-request
+                // the lock while we are still capturing instead of leaving
+                // the local cursor free to move.
+                if state.capturing && state.unlock_retries < 5 {
+                    state.unlock_retries += 1;
+                    let window = state.focused.clone();
+                    let pointer = state.pointer.clone();
+                    if let (Some(window), Some(pointer)) = (window, pointer) {
+                        if let Some(stale) = state.pointer_lock.take() {
+                            stale.destroy();
+                        }
+                        log::debug!("re-locking pointer after compositor unlock");
+                        let lock = state.globals.pointer_constraints.lock_pointer(
+                            &window.surface,
+                            &pointer,
+                            None,
+                            Lifetime::Persistent,
+                            qh,
+                            (),
+                        );
+                        state.pointer_lock = Some(lock);
+                        state.pointer_lock_requested = true;
+                        pointer.set_cursor(
+                            state.last_enter_serial,
+                            Some(&state.cursor_surface),
+                            0,
+                            0,
+                        );
+                        if let Err(e) = state.connection.flush() {
+                            log::warn!("failed to flush re-lock request: {e}");
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
