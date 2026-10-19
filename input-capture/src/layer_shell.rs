@@ -8,6 +8,7 @@ use std::{
     os::fd::{AsFd, RawFd},
     pin::Pin,
     task::{Context, Poll, ready},
+    time::Instant,
 };
 use tokio::io::unix::AsyncFd;
 
@@ -128,6 +129,10 @@ struct State {
     pending_events: VecDeque<(Position, CaptureEvent)>,
     outputs: Vec<Output>,
     scroll_discrete_pending: bool,
+    /// While set, pointer Enter events on a capture strip are ignored instead
+    /// of grabbing. Set after a programmatic seam warp so the warped cursor
+    /// cannot immediately re-arm the capture and bounce control back.
+    suppress_until: Option<Instant>,
 }
 
 struct Inner {
@@ -335,6 +340,7 @@ impl LayerShellInputCapture {
             pending_events: VecDeque::new(),
             outputs: vec![],
             scroll_discrete_pending: false,
+            suppress_until: None,
         };
 
         for global in state.global_list.contents().clone_list() {
@@ -627,6 +633,12 @@ impl Capture for LayerShellInputCapture {
         Ok(inner.flush_events()?)
     }
 
+    fn suppress(&mut self, dur: std::time::Duration) {
+        let inner = self.0.get_mut();
+        inner.state.suppress_until = Some(Instant::now() + dur);
+        log::debug!("suppressing capture starts for {dur:?}");
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }
@@ -721,9 +733,22 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x: _,
-                surface_y: _,
+                surface_x,
+                surface_y,
             } => {
+                // A programmatic seam warp can drop the cursor onto this strip
+                // and would otherwise immediately re-arm the capture, bouncing
+                // control back to the peer forever. Ignore the resulting Enter
+                // for the suppression window.
+                if let Some(until) = app.suppress_until {
+                    if Instant::now() < until {
+                        log::debug!(
+                            "ignoring capture enter at ({surface_x},{surface_y}) during seam-warp suppression"
+                        );
+                        return;
+                    }
+                    app.suppress_until = None;
+                }
                 // get client corresponding to the focused surface
                 {
                     if let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) {
@@ -742,6 +767,9 @@ impl Dispatch<WlPointer, ()> for State {
                 app.pending_events.push_back((pos, CaptureEvent::Begin));
             }
             wl_pointer::Event::Leave { .. } => {
+                // The pointer is off the strip, so any pending warp
+                // suppression is no longer needed.
+                app.suppress_until = None;
                 /* There are rare cases, where when a window is opened in
                  * just the wrong moment, the pointer is released, while
                  * still grabbed.

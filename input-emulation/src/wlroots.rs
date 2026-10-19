@@ -223,6 +223,27 @@ impl State {
     }
 }
 
+/// Pick the monitor that forms the outer edge on `side`. When several monitors
+/// share that edge (a stacked seam), prefer the largest one, so the cursor
+/// lands on the monitor that most likely faces the peer instead of whichever
+/// output happened to be registered first.
+fn seam_output(geoms: &[OutputGeom], side: PointerSide) -> Option<&OutputGeom> {
+    let edge = |g: &OutputGeom| match side {
+        PointerSide::Left => g.position.0,
+        PointerSide::Right => g.position.0 + g.size.0,
+        PointerSide::Top => g.position.1,
+        PointerSide::Bottom => g.position.1 + g.size.1,
+    };
+    let outer = match side {
+        PointerSide::Left | PointerSide::Top => geoms.iter().map(edge).min()?,
+        PointerSide::Right | PointerSide::Bottom => geoms.iter().map(edge).max()?,
+    };
+    geoms
+        .iter()
+        .filter(|g| edge(g) == outer)
+        .max_by_key(|g| (g.size.0 as i64) * (g.size.1 as i64))
+}
+
 /// Choose a point just inside the outer edge of the monitor that is outermost
 /// on `side`, plus the global logical layout bounds. Returns
 /// `(target, (min_x, min_y), (max_x, max_y))` in the compositor's global
@@ -238,34 +259,23 @@ fn seam_target(
     if geoms.is_empty() {
         return None;
     }
+    let m = seam_output(geoms, side)?;
     let min_x = geoms.iter().map(|g| g.position.0).min()?;
     let min_y = geoms.iter().map(|g| g.position.1).min()?;
     let max_x = geoms.iter().map(|g| g.position.0 + g.size.0).max()?;
     let max_y = geoms.iter().map(|g| g.position.1 + g.size.1).max()?;
 
     let target = match side {
-        PointerSide::Left => {
-            let m = geoms.iter().min_by_key(|g| g.position.0)?;
-            (min_x + margin, m.position.1 + m.size.1 / 2)
-        }
-        PointerSide::Right => {
-            let m = geoms.iter().max_by_key(|g| g.position.0 + g.size.0)?;
-            (
-                m.position.0 + m.size.0 - margin,
-                m.position.1 + m.size.1 / 2,
-            )
-        }
-        PointerSide::Top => {
-            let m = geoms.iter().min_by_key(|g| g.position.1)?;
-            (m.position.0 + m.size.0 / 2, min_y + margin)
-        }
-        PointerSide::Bottom => {
-            let m = geoms.iter().max_by_key(|g| g.position.1 + g.size.1)?;
-            (
-                m.position.0 + m.size.0 / 2,
-                m.position.1 + m.size.1 - margin,
-            )
-        }
+        PointerSide::Left => (m.position.0 + margin, m.position.1 + m.size.1 / 2),
+        PointerSide::Right => (
+            m.position.0 + m.size.0 - margin,
+            m.position.1 + m.size.1 / 2,
+        ),
+        PointerSide::Top => (m.position.0 + m.size.0 / 2, m.position.1 + margin),
+        PointerSide::Bottom => (
+            m.position.0 + m.size.0 / 2,
+            m.position.1 + m.size.1 - margin,
+        ),
     };
     Some((target, (min_x, min_y), (max_x, max_y)))
 }
@@ -335,7 +345,7 @@ impl Emulation for WlrootsEmulation {
         handle: EmulationHandle,
         side: PointerSide,
     ) -> Result<(), EmulationError> {
-        const MARGIN: i32 = 12;
+        const MARGIN: i32 = 24;
         let geoms: Vec<OutputGeom> = self
             .state
             .outputs

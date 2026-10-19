@@ -171,6 +171,13 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// Ignore capture starts for `dur`. Used right after a programmatic pointer
+    /// warp so the warped cursor cannot immediately re-arm the local capture,
+    /// which would bounce control back to the peer (border lock).
+    pub fn suppress(&mut self, dur: std::time::Duration) {
+        self.capture.suppress(dur)
+    }
+
     /// Drain and return every key the capture has forwarded as
     /// down-but-not-up. The caller is expected to synthesize key-up
     /// events to the remote peer for each — otherwise the peer
@@ -286,6 +293,11 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
+
+    /// Ignore capture starts for `dur` (default: no-op). Backends that can
+    /// position the pointer should implement this so a warp cannot re-arm the
+    /// capture immediately.
+    fn suppress(&mut self, _dur: std::time::Duration) {}
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
