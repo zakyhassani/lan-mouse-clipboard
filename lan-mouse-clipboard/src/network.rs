@@ -12,9 +12,18 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadHalf};
 use tokio::sync::{mpsc, watch};
 
+use crate::item::origin_from_fingerprint;
 use crate::protocol::{FrameReader, KIND_PING, KIND_PONG, Message};
 use crate::registry::{ConnKind, ConnectionRegistry};
 use crate::transport::{ClientConfig, ClientStream, ServerStream, TlsListener, connect};
+
+/// One inbound frame plus the authenticated origin of the connection it
+/// arrived on. The origin is never taken from the payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundFrame {
+    pub origin: [u8; 8],
+    pub payload: Vec<u8>,
+}
 
 /// Events the network task raises for the owning service. Both a new
 /// connection and a failed health check mean the peer's live address should
@@ -35,6 +44,9 @@ pub enum NetworkEvent {
 pub struct PeerEndpoints {
     /// Stable peer identity (certificate fingerprint).
     pub id: String,
+    /// Canonical 8-byte origin of the peer, used to avoid dialing a peer that
+    /// already has a live channel in either direction.
+    pub origin: [u8; 8],
     /// Preferred address to dial.
     pub active: SocketAddr,
     /// Other registered addresses, tried in order if `active` fails.
@@ -64,8 +76,12 @@ impl PeerEndpoints {
 /// Runtime limits for the clipboard network task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetworkLimits {
-    /// Total size cap for a single item; bounds inbound frames.
+    /// Total size cap for a single clipboard item; bounds text/image frames.
     pub max_item_size: usize,
+    /// Absolute manifest cap used to size the file-frame ceiling. This is not
+    /// the receiver's decode cap; the driver enforces that separately so an
+    /// oversized offer still falls back to its Announce instead of losing it.
+    pub max_manifest_bytes: usize,
     /// Idle timeout for outgoing connections.
     pub idle_timeout: Duration,
 }
@@ -91,6 +107,16 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// (initial connect) or just failed.
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Channels between the driver and the network task.
+pub struct NetworkChannels {
+    /// Inbound frames tagged with the authenticated peer origin.
+    pub inbound: mpsc::Sender<InboundFrame>,
+    /// Frames to write to every live connection.
+    pub broadcast: mpsc::Receiver<Vec<u8>>,
+    /// Frames to write to exactly one peer origin.
+    pub directed: mpsc::Receiver<([u8; 8], Vec<u8>)>,
+}
+
 /// Run the clipboard TLS server until the broadcast channel closes.
 ///
 /// Always polls the listener for incoming peers, while background tasks
@@ -107,19 +133,23 @@ pub async fn run_clipboard_server(
     listener: TlsListener,
     client_config: ClientConfig,
     mut peers: watch::Receiver<Vec<PeerEndpoints>>,
-    inbound_tx: mpsc::Sender<Vec<u8>>,
-    mut broadcast_rx: mpsc::Receiver<Vec<u8>>,
+    channels: NetworkChannels,
     limits: NetworkLimits,
     event_tx: mpsc::Sender<NetworkEvent>,
 ) {
+    let NetworkChannels {
+        inbound: inbound_tx,
+        broadcast: mut broadcast_rx,
+        directed: mut directed_rx,
+    } = channels;
     let NetworkLimits {
         max_item_size,
+        max_manifest_bytes,
         idle_timeout,
     } = limits;
-    // Inbound frames are capped at the configured item size (plus framing
-    // overhead); this is the receive-side guard matching the driver's
-    // encode-side cap.
-    let max_payload = crate::protocol::max_payload_size(max_item_size);
+    // Inbound frames are capped at the larger of the item and file-frame
+    // ceilings; this is the receive-side guard matching the encode-side caps.
+    let max_payload = crate::protocol::max_frame_payload(max_item_size, max_manifest_bytes);
     let mut registry = ConnectionRegistry::new(idle_timeout);
     // Channel from background connect-tasks back to this loop. Carries the
     // peer id so a failed dial can rotate that peer to its next fallback.
@@ -216,13 +246,51 @@ pub async fn run_clipboard_server(
                             if registry.contains(&addr) {
                                 continue;
                             }
+                            // Bind the origin to the certificate the server
+                            // actually presented, not to a config spelling of
+                            // the fingerprint. This also rejects a server at
+                            // the configured address that is not the expected
+                            // peer (the client TLS layer does not verify).
+                            let Some(actual_fp) = crate::transport::peer_fingerprint(&stream)
+                            else {
+                                log::warn!(
+                                    "clipboard peer {addr} presented no certificate; refusing"
+                                );
+                                dial.advance(addr);
+                                continue;
+                            };
+                            if !peer_id.is_empty()
+                                && normalize_fingerprint(&actual_fp)
+                                    != normalize_fingerprint(&peer_id)
+                            {
+                                log::warn!(
+                                    "clipboard peer {addr} presented an unexpected certificate; refusing"
+                                );
+                                dial.advance(addr);
+                                continue;
+                            }
+                            let origin = origin_from_fingerprint(&actual_fp);
+                            if registry.contains_origin(origin) {
+                                log::debug!(
+                                    "clipboard dropping duplicate outgoing channel to {addr}"
+                                );
+                                continue;
+                            }
                             log::info!("clipboard connected to peer {addr}");
                             let (r, w) = tokio::io::split(stream);
-                            registry.insert(addr, Box::new(w), ConnKind::Outgoing);
-                            dial.live.insert(addr);
+                            registry.insert(addr, origin, Box::new(w), ConnKind::Outgoing);
+                            dial.note_live(addr, origin);
                             last_seen.insert(addr, Instant::now());
                             dial.current.insert(peer_id, addr);
-                            spawn_read_loop(r, addr, &inbound_tx, &disc_tx, &health_tx, max_payload);
+                            spawn_read_loop(
+                                r,
+                                addr,
+                                origin,
+                                &inbound_tx,
+                                &disc_tx,
+                                &health_tx,
+                                max_payload,
+                            );
                             // Retrain IPs on every connect so peers converge
                             // on the live address.
                             let _ = event_tx.try_send(NetworkEvent::Retrain);
@@ -268,19 +336,47 @@ pub async fn run_clipboard_server(
                 }
                 None => break,
             },
+            directed = directed_rx.recv() => match directed {
+                Some((origin, frame)) => {
+                    let addr = registry.addr_for_origin(origin);
+                    if !registry.write_to_origin(origin, &frame).await {
+                        log::debug!(
+                            "clipboard directed frame for unavailable peer {:02x?}",
+                            origin
+                        );
+                        if let Some(addr) = addr {
+                            dial.forget(&mut registry, &mut last_seen, &addr);
+                            dial.advance(addr);
+                        }
+                    }
+                }
+                None => break,
+            },
             accepted = accept_rx.recv() => {
                 if let Some((stream, addr, fp)) = accepted {
                     log::info!("clipboard peer connected: {fp} @ {addr}");
-                    // One channel per peer: drop a duplicate from an IP we
-                    // already have a live channel to (any port).
-                    if registry.entries().iter().any(|(a, _)| a.ip() == addr.ip()) {
+                    let origin = origin_from_fingerprint(&fp);
+                    // One channel per peer: key on the authenticated origin
+                    // and also reject a duplicate from an IP we already serve.
+                    if registry.contains_origin(origin)
+                        || registry.entries().iter().any(|(a, _, _)| a.ip() == addr.ip())
+                    {
                         log::debug!("clipboard dropping duplicate channel from {addr}");
                         continue;
                     }
                     let (r, w) = tokio::io::split(stream);
-                    registry.insert(addr, Box::new(w), ConnKind::Incoming);
+                    registry.insert(addr, origin, Box::new(w), ConnKind::Incoming);
+                    dial.note_live(addr, origin);
                     last_seen.insert(addr, Instant::now());
-                    spawn_read_loop(r, addr, &inbound_tx, &disc_tx, &health_tx, max_payload);
+                    spawn_read_loop(
+                        r,
+                        addr,
+                        origin,
+                        &inbound_tx,
+                        &disc_tx,
+                        &health_tx,
+                        max_payload,
+                    );
                     let _ = event_tx.try_send(NetworkEvent::Retrain);
                 }
             }
@@ -290,10 +386,19 @@ pub async fn run_clipboard_server(
 
 /// Start the per-channel read loop, which feeds inbound frames, disconnect
 /// notifications, and health frames back to the server loop.
+fn normalize_fingerprint(fingerprint: &str) -> String {
+    fingerprint
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
 fn spawn_read_loop<R>(
     reader: ReadHalf<R>,
     addr: SocketAddr,
-    inbound_tx: &mpsc::Sender<Vec<u8>>,
+    origin: [u8; 8],
+    inbound_tx: &mpsc::Sender<InboundFrame>,
     disc_tx: &mpsc::Sender<SocketAddr>,
     health_tx: &mpsc::Sender<HealthEvent>,
     max_payload: usize,
@@ -303,6 +408,7 @@ fn spawn_read_loop<R>(
     tokio::spawn(read_loop(
         reader,
         addr,
+        origin,
         inbound_tx.clone(),
         disc_tx.clone(),
         health_tx.clone(),
@@ -317,8 +423,9 @@ struct DialState {
     peers: Vec<PeerEndpoints>,
     /// Endpoint currently dialed/used per peer id.
     current: HashMap<String, SocketAddr>,
-    /// Endpoints with a live channel.
-    live: HashSet<SocketAddr>,
+    /// Live channels by address, with the authenticated peer origin. Incoming
+    /// channels are included, so a peer with a live accept is not dialed.
+    live: HashMap<SocketAddr, [u8; 8]>,
     /// Endpoints with a connect attempt in flight.
     dialing: HashSet<SocketAddr>,
 }
@@ -329,13 +436,21 @@ impl DialState {
         Self {
             peers,
             current,
-            live: HashSet::new(),
+            live: HashMap::new(),
             dialing: HashSet::new(),
         }
     }
 
+    fn note_live(&mut self, addr: SocketAddr, origin: [u8; 8]) {
+        self.live.insert(addr, origin);
+    }
+
     fn has_live(&self, peer: &PeerEndpoints) -> bool {
-        peer.all().iter().any(|a| self.live.contains(a))
+        if self.live.values().any(|origin| *origin == peer.origin) {
+            return true;
+        }
+        let endpoints = peer.all();
+        self.live.keys().any(|addr| endpoints.contains(addr))
     }
 
     /// Adopt a new peer set. A peer without a live channel prefers its
@@ -363,11 +478,7 @@ impl DialState {
     fn spawn(&mut self, client_config: &ClientConfig, conn_tx: &mpsc::Sender<ConnResult>) {
         let mut to_dial = Vec::new();
         for peer in &self.peers {
-            if peer
-                .all()
-                .iter()
-                .any(|a| self.live.contains(a) || self.dialing.contains(a))
-            {
+            if self.has_live(peer) || peer.all().iter().any(|a| self.dialing.contains(a)) {
                 continue;
             }
             let addr = self.current.get(&peer.id).copied().unwrap_or(peer.active);
@@ -418,15 +529,19 @@ impl DialState {
 
     /// Keep only one channel per peer: drop outgoing channels that are no
     /// longer the peer's current endpoint (or whose IP is no longer a known
-    /// endpoint) and duplicate incoming channels from one IP.
+    /// endpoint) and any duplicate channel for the same peer origin.
     fn prune(
         &mut self,
         registry: &mut ConnectionRegistry,
         last_seen: &mut HashMap<SocketAddr, Instant>,
     ) {
-        let mut seen_incoming: HashSet<IpAddr> = HashSet::new();
+        let mut entries = registry.entries();
+        // Outgoing channels matching their peer's current endpoint win over
+        // incoming duplicates.
+        entries.sort_by_key(|(_, _, kind)| *kind != ConnKind::Outgoing);
+        let mut seen_origins: HashSet<[u8; 8]> = HashSet::new();
         let mut to_drop = Vec::new();
-        for (addr, kind) in registry.entries() {
+        for (addr, origin, kind) in entries {
             match kind {
                 ConnKind::Outgoing => {
                     let current = self
@@ -434,13 +549,12 @@ impl DialState {
                         .iter()
                         .find(|p| p.contains_ip(addr.ip()))
                         .map(|p| self.current.get(&p.id).copied().unwrap_or(p.active));
-                    if current != Some(addr) {
+                    if current != Some(addr) || !seen_origins.insert(origin) {
                         to_drop.push(addr);
                     }
                 }
                 ConnKind::Incoming => {
-                    // At most one incoming channel per peer IP.
-                    if !seen_incoming.insert(addr.ip()) {
+                    if !seen_origins.insert(origin) {
                         to_drop.push(addr);
                     }
                 }
@@ -459,14 +573,15 @@ impl DialState {
 async fn read_loop<R>(
     mut reader: ReadHalf<R>,
     addr: SocketAddr,
-    tx: mpsc::Sender<Vec<u8>>,
+    origin: [u8; 8],
+    tx: mpsc::Sender<InboundFrame>,
     disc_tx: mpsc::Sender<SocketAddr>,
     health_tx: mpsc::Sender<HealthEvent>,
     max_payload: usize,
 ) where
     R: AsyncRead + Unpin,
 {
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; 64 * 1024];
     let mut frames = FrameReader::with_max_payload(max_payload);
     loop {
         let n = match reader.read(&mut buf).await {
@@ -488,7 +603,7 @@ async fn read_loop<R>(
                         let _ = health_tx.send(HealthEvent::Pong(addr)).await;
                     }
                     _ => {
-                        if tx.send(payload).await.is_err() {
+                        if tx.send(InboundFrame { origin, payload }).await.is_err() {
                             return;
                         }
                     }
@@ -572,15 +687,18 @@ mod tests {
 
         let (in_a_tx, mut in_a_rx) = mpsc::channel(64);
         let (bc_a_tx, bc_a_rx) = mpsc::channel(64);
+        let (dir_a_tx, dir_a_rx) = mpsc::channel(16);
         let (in_b_tx, mut in_b_rx) = mpsc::channel(64);
         let (bc_b_tx, bc_b_rx) = mpsc::channel(64);
+        let (_dir_b_tx, dir_b_rx) = mpsc::channel(16);
 
         let cfg_a = client_config(&a.identity).expect("cfg a");
         let cfg_b = client_config(&b.identity).expect("cfg b");
 
         // A initiates to B; B only listens/accepts.
         let (peers_a_tx, peers_a_rx) = watch::channel(vec![PeerEndpoints {
-            id: "peer-b".to_string(),
+            id: b.fingerprint.clone(),
+            origin: origin_from_fingerprint(&b.fingerprint),
             active: addr_b,
             fallbacks: Vec::new(),
         }]);
@@ -592,10 +710,14 @@ mod tests {
             listener_a,
             cfg_a,
             peers_a_rx,
-            in_a_tx,
-            bc_a_rx,
+            NetworkChannels {
+                inbound: in_a_tx,
+                broadcast: bc_a_rx,
+                directed: dir_a_rx,
+            },
             NetworkLimits {
                 max_item_size: 64 * 1024 * 1024,
+                max_manifest_bytes: 16 * 1024 * 1024,
                 idle_timeout: Duration::from_secs(60),
             },
             ev_a_tx,
@@ -607,10 +729,14 @@ mod tests {
             listener_b,
             cfg_b,
             peers_b_rx,
-            in_b_tx,
-            bc_b_rx,
+            NetworkChannels {
+                inbound: in_b_tx,
+                broadcast: bc_b_rx,
+                directed: dir_b_rx,
+            },
             NetworkLimits {
                 max_item_size: 64 * 1024 * 1024,
+                max_manifest_bytes: 16 * 1024 * 1024,
                 idle_timeout: Duration::from_secs(60),
             },
             ev_b_tx,
@@ -639,7 +765,7 @@ mod tests {
         })
         .await
         .expect("timeout waiting for B to receive");
-        assert_eq!(got, payload);
+        assert_eq!(got.payload, payload);
 
         // And the reverse direction.
         let item_b = ClipboardItem::text("hello from B", [0xBB; 8], 1);
@@ -656,7 +782,65 @@ mod tests {
         })
         .await
         .expect("timeout waiting for A to receive");
-        assert_eq!(got_b, payload_b);
+        assert_eq!(got_b.payload, payload_b);
+
+        // Directed frames reach only the peer with the matching origin.
+        let directed = ClipboardItem::text("directed to B", [0xCC; 8], 7);
+        let directed_frame = Message::Announce(directed).encode(1024).unwrap();
+        let directed_payload = directed_frame[4..].to_vec();
+        dir_a_tx
+            .send((
+                origin_from_fingerprint(&b.fingerprint),
+                directed_frame.clone(),
+            ))
+            .await
+            .unwrap();
+        let got_directed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(p) = in_b_rx.recv().await {
+                    if p.payload == directed_payload {
+                        break p;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for directed frame");
+        assert_eq!(got_directed.payload, directed_payload);
+        // The same directed send to an unknown origin is dropped, not broadcast.
+        dir_a_tx.send(([0xEE; 8], directed_frame)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), in_b_rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn live_incoming_origin_prevents_redial() {
+        let origin = origin_from_fingerprint("peer-b");
+        let peer = PeerEndpoints {
+            id: "peer-b".into(),
+            origin,
+            active: SocketAddr::from(([127, 0, 0, 1], 4242)),
+            fallbacks: Vec::new(),
+        };
+        let mut dial = DialState::new(vec![peer.clone()]);
+        assert!(!dial.has_live(&peer));
+        assert!(dial.any_missing());
+
+        // An accepted channel has an ephemeral source address but the same
+        // authenticated origin; it must still count as live for this peer.
+        let incoming = SocketAddr::from(([127, 0, 0, 1], 5555));
+        dial.note_live(incoming, origin);
+        assert!(dial.has_live(&peer));
+        assert!(!dial.any_missing());
+
+        let mut registry = ConnectionRegistry::new(Duration::from_secs(60));
+        let mut last_seen = HashMap::new();
+        dial.forget(&mut registry, &mut last_seen, &incoming);
+        assert!(!dial.has_live(&peer));
+        assert!(dial.any_missing());
     }
 
     // --- read_loop unit tests using a duplex stream as a test double ---
@@ -679,6 +863,7 @@ mod tests {
         let task = tokio::spawn(read_loop(
             r_half,
             addr,
+            [1; 8],
             tx,
             dtx,
             htx,
@@ -689,7 +874,7 @@ mod tests {
         drop(w); // EOF signals the read loop to stop
 
         let payload = rx.recv().await.unwrap();
-        assert_eq!(payload, frame[4..].to_vec());
+        assert_eq!(payload.payload, frame[4..].to_vec());
         let _ = task.await;
     }
 
@@ -708,6 +893,7 @@ mod tests {
         let task = tokio::spawn(read_loop(
             r_half,
             addr,
+            [1; 8],
             tx,
             dtx,
             htx,
@@ -723,7 +909,7 @@ mod tests {
         drop(w);
 
         let payload = rx.recv().await.unwrap();
-        assert_eq!(payload, good[4..].to_vec());
+        assert_eq!(payload.payload, good[4..].to_vec());
         let _ = task.await;
     }
 }

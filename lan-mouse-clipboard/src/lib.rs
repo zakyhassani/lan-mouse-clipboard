@@ -8,6 +8,8 @@
 
 pub mod backend;
 pub mod dedup;
+#[cfg(target_os = "linux")]
+pub mod file;
 pub mod item;
 pub mod network;
 pub mod protocol;
@@ -20,6 +22,15 @@ mod test_util;
 pub use backend::BackendKind;
 pub use item::{ClipboardItem, DEFAULT_MAX_ITEM_SIZE, MAX_ITEM_SIZE_LIMIT};
 
+/// Default manifest entry cap for lazy file offers.
+pub const DEFAULT_FILE_MANIFEST_MAX_ENTRIES: usize = 100_000;
+/// Absolute manifest entry cap.
+pub const MAX_FILE_MANIFEST_MAX_ENTRIES: usize = 1_000_000;
+/// Default manifest byte cap for lazy file offers (16 MiB).
+pub const DEFAULT_FILE_MANIFEST_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Absolute manifest byte cap (64 MiB).
+pub const MAX_FILE_MANIFEST_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 use std::pin::Pin;
 
 use futures::{Stream, StreamExt};
@@ -28,7 +39,39 @@ use tokio::sync::mpsc;
 use crate::backend::{ClipboardBackend, build_backends};
 use crate::dedup::LoopPrevention;
 use crate::item::ClipboardChange;
+use crate::network::InboundFrame;
 use crate::protocol::Message;
+
+/// Lazy file-sync settings.
+///
+/// `enabled` is the user preference; the file subsystem starts on the first
+/// time clipboard sync is enabled (and only on Linux).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileOptions {
+    pub enabled: bool,
+    pub max_entries: usize,
+    pub max_manifest_bytes: usize,
+}
+
+impl Default for FileOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: DEFAULT_FILE_MANIFEST_MAX_ENTRIES,
+            max_manifest_bytes: DEFAULT_FILE_MANIFEST_MAX_BYTES,
+        }
+    }
+}
+
+/// Everything the clipboard driver needs to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardOptions {
+    pub enabled: bool,
+    pub backend: BackendKind,
+    pub max_item_size: usize,
+    pub origin: [u8; 8],
+    pub files: FileOptions,
+}
 
 /// Events emitted by the clipboard subsystem for frontends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,31 +100,40 @@ struct ClipboardInner {
     backends: Vec<Box<dyn ClipboardBackend>>,
     loop_prevention: LoopPrevention,
     watcher: Option<Pin<Box<dyn Stream<Item = ClipboardChange> + Send>>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    file_options: FileOptions,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    direct_tx: mpsc::Sender<([u8; 8], Vec<u8>)>,
+    #[cfg(target_os = "linux")]
+    files: Option<file::FileService>,
 }
 
 impl Clipboard {
     /// Create the clipboard subsystem, spawning its driver task.
     ///
-    /// `inbound_rx` receives frames from the network task; `broadcast_tx`
-    /// carries broadcast frames to the network task. `max_item_size` is the
-    /// total size cap for a single item (all representations combined).
+    /// `inbound_rx` receives frames (tagged with the authenticated peer
+    /// origin) from the network task; `broadcast_tx` carries broadcast frames
+    /// and `directed_tx` carries replies to one peer. The item size cap applies
+    /// to text/image items; file frames have their own caps.
     pub fn new(
-        enabled: bool,
-        backend: BackendKind,
-        max_item_size: usize,
-        origin: [u8; 8],
-        inbound_rx: mpsc::Receiver<Vec<u8>>,
+        options: ClipboardOptions,
+        inbound_rx: mpsc::Receiver<InboundFrame>,
         broadcast_tx: mpsc::Sender<Vec<u8>>,
+        directed_tx: mpsc::Sender<([u8; 8], Vec<u8>)>,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::channel(16);
         let (event_tx, event_rx) = mpsc::channel(16);
         let inner = ClipboardInner {
-            enabled,
-            origin,
-            max_item_size,
-            backends: build_backends(backend, max_item_size),
-            loop_prevention: LoopPrevention::new(origin),
+            enabled: options.enabled,
+            origin: options.origin,
+            max_item_size: options.max_item_size,
+            backends: build_backends(options.backend, options.max_item_size),
+            loop_prevention: LoopPrevention::new(options.origin),
             watcher: None,
+            file_options: options.files,
+            direct_tx: directed_tx,
+            #[cfg(target_os = "linux")]
+            files: None,
         };
         let task = tokio::spawn(run_clipboard(
             inner,
@@ -117,9 +169,18 @@ async fn run_clipboard(
     mut inner: ClipboardInner,
     mut request_rx: mpsc::Receiver<ClipboardRequest>,
     event_tx: mpsc::Sender<ClipboardEvent>,
-    mut inbound_rx: mpsc::Receiver<Vec<u8>>,
+    mut inbound_rx: mpsc::Receiver<InboundFrame>,
     broadcast_tx: mpsc::Sender<Vec<u8>>,
 ) {
+    #[cfg(target_os = "linux")]
+    let mut build_rx = if inner.enabled {
+        start_files(&mut inner)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut build_rx: Option<mpsc::Receiver<PreparedItem>> = None;
+
     if inner.enabled {
         ensure_watcher(&mut inner).await;
     }
@@ -136,6 +197,10 @@ async fn run_clipboard(
                         ClipboardEvent::Disabled
                     }).await;
                     if enabled {
+                        #[cfg(target_os = "linux")]
+                        if build_rx.is_none() {
+                            build_rx = start_files(&mut inner);
+                        }
                         ensure_watcher(&mut inner).await;
                     } else {
                         inner.watcher = None;
@@ -143,33 +208,319 @@ async fn run_clipboard(
                 }
                 None => break,
             },
-            change = poll_watcher(&mut inner.watcher) => {
-                let Some(ClipboardChange::New(mut item)) = change else { continue; };
-                if !inner.enabled { continue; }
-                item.origin = inner.origin;
-                item.serial = inner.loop_prevention.next_serial();
-                if inner.loop_prevention.on_local_change(&item) {
-                    // Remember every rep we are about to send so a peer that
-                    // can only reproduce the primary rep cannot bounce a
-                    // secondary rep back as new content.
-                    inner.loop_prevention.note_sent(&item);
-                    match Message::Announce(item).encode(inner.max_item_size) {
-                        Ok(frame) => {
-                            if broadcast_tx.send(frame).await.is_err() { break; }
-                        }
-                        Err(e) => log::warn!("failed to encode clipboard item: {e}"),
+            change = poll_watcher(&mut inner.watcher) => match change {
+                Some(ClipboardChange::New(item)) => {
+                    if !inner.enabled { continue; }
+                    if !handle_local_change(&mut inner, item, &broadcast_tx).await {
+                        break;
                     }
                 }
+                None => {
+                    // The backend's change stream ended. Clear it so the
+                    // select loop parks instead of polling a closed stream.
+                    log::warn!("clipboard watcher ended");
+                    inner.watcher = None;
+                }
+            },
+            prepared = poll_prepared(&mut build_rx) => {
+                let Some(prepared) = prepared else {
+                    // The build worker is gone; stop polling the closed
+                    // channel so the select loop does not spin.
+                    build_rx = None;
+                    continue;
+                };
+                if !handle_prepared(&mut inner, prepared, &broadcast_tx).await { break; }
             }
             frame = inbound_rx.recv() => match frame {
-                Some(payload) => {
-                    if let Ok(Message::Announce(item)) = Message::decode(&payload) {
-                        apply_remote(&mut inner, &item).await;
-                    }
-                }
+                Some(frame) => handle_inbound(&mut inner, frame, &broadcast_tx).await,
                 None => break,
             },
         }
+    }
+}
+
+/// A manifest build result. Only Linux builds the lazy file view.
+#[cfg(target_os = "linux")]
+use crate::file::sender::PreparedItem;
+#[cfg(not(target_os = "linux"))]
+struct PreparedItem;
+
+/// Start the file subsystem on first enable, if it is configured.
+#[cfg(target_os = "linux")]
+fn start_files(inner: &mut ClipboardInner) -> Option<mpsc::Receiver<PreparedItem>> {
+    if inner.files.is_some() || !inner.file_options.enabled {
+        return None;
+    }
+    match file::FileService::start(
+        inner.file_options,
+        inner.direct_tx.clone(),
+        tokio::runtime::Handle::current(),
+    ) {
+        Some((files, rx)) => {
+            inner.files = Some(files);
+            Some(rx)
+        }
+        None => None,
+    }
+}
+
+/// Await the next prepared local item (or park when file sync is off).
+async fn poll_prepared(
+    build_rx: &mut Option<mpsc::Receiver<PreparedItem>>,
+) -> Option<PreparedItem> {
+    match build_rx {
+        Some(rx) => rx.recv().await,
+        None => futures::future::pending().await,
+    }
+}
+
+/// Broadcast a local clipboard item as an Announce. Returns false when the
+/// network channel is closed.
+async fn broadcast_announce(
+    max_item_size: usize,
+    item: ClipboardItem,
+    broadcast_tx: &mpsc::Sender<Vec<u8>>,
+) -> bool {
+    match Message::Announce(item).encode(max_item_size) {
+        Ok(frame) => broadcast_tx.send(frame).await.is_ok(),
+        Err(e) => {
+            log::warn!("failed to encode clipboard item: {e}");
+            true
+        }
+    }
+}
+
+/// Apply loop prevention to a local change, queue file candidates for a
+/// manifest, and broadcast everything else immediately.
+async fn handle_local_change(
+    inner: &mut ClipboardInner,
+    mut item: ClipboardItem,
+    broadcast_tx: &mpsc::Sender<Vec<u8>>,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(files) = &inner.files {
+        // Reading a file from the lazy view changes the local clipboard to
+        // URIs that point back into our own mount. Never echo those.
+        let paths = file::manifest::item_paths(&item);
+        if !paths.is_empty() && paths.iter().all(|p| files.receiver.contains_path(p)) {
+            log::debug!("file sync: ignoring local change from the lazy view");
+            return true;
+        }
+    }
+
+    item.origin = inner.origin;
+    item.serial = inner.loop_prevention.next_serial();
+    if !inner.loop_prevention.on_local_change(&item) {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(files) = &inner.files {
+        if file::manifest::is_file_candidate(&item) {
+            if files.worker.submit(item.clone()).await {
+                return true;
+            }
+            log::warn!("file sync: manifest worker stopped; sending Announce only");
+        }
+    }
+
+    inner.loop_prevention.note_sent(&item);
+    broadcast_announce(inner.max_item_size, item, broadcast_tx).await
+}
+
+/// Send a built file offer before its Announce so a new peer can create the
+/// view and a new receiver can suppress the legacy path.
+async fn handle_prepared(
+    inner: &mut ClipboardInner,
+    prepared: PreparedItem,
+    broadcast_tx: &mpsc::Sender<Vec<u8>>,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let file::sender::PreparedItem { item, offer } = prepared;
+        if !inner.enabled {
+            return true;
+        }
+        inner.loop_prevention.note_sent(&item);
+        if let (Some(files), Some(offer)) = (inner.files.as_ref(), offer) {
+            log::info!(
+                "file sync: offering {} entries ({} manifest bytes) as serial {}",
+                offer.manifest.entries.len(),
+                offer.encoded.len(),
+                item.serial
+            );
+            files.offers.insert(item.serial, &offer);
+            let message = Message::FileOffer(protocol::FileOffer {
+                version: protocol::FILE_PROTOCOL_VERSION,
+                origin: item.origin,
+                serial: item.serial,
+                manifest: offer.encoded.clone(),
+            });
+            match message.encode(inner.max_item_size) {
+                Ok(frame) => {
+                    if broadcast_tx.send(frame).await.is_err() {
+                        return false;
+                    }
+                }
+                Err(e) => log::warn!("file sync: cannot encode offer: {e}"),
+            }
+        }
+        broadcast_announce(inner.max_item_size, item, broadcast_tx).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (inner, prepared, broadcast_tx);
+        true
+    }
+}
+
+/// Dispatch one inbound frame from an authenticated peer.
+async fn handle_inbound(
+    inner: &mut ClipboardInner,
+    frame: InboundFrame,
+    _broadcast_tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let peer_origin = frame.origin;
+    match Message::decode(&frame.payload) {
+        Ok(Message::Announce(item)) => {
+            #[cfg(target_os = "linux")]
+            if let Some(files) = &mut inner.files {
+                if files.receiver.take_lazy(item.origin, item.serial) {
+                    log::debug!(
+                        "file sync: suppressing Announce for lazy offer {}",
+                        item.serial
+                    );
+                    return;
+                }
+            }
+            apply_remote(inner, &item).await;
+        }
+        Ok(Message::FileOffer(offer)) => handle_file_offer(inner, peer_origin, &offer).await,
+        Ok(Message::FileRead(read)) => handle_file_read(inner, peer_origin, read).await,
+        Ok(Message::FileData(data)) => {
+            #[cfg(target_os = "linux")]
+            if let Some(files) = &inner.files {
+                files.broker.complete(peer_origin, data);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = data;
+        }
+        Ok(Message::FileError(error)) => {
+            #[cfg(target_os = "linux")]
+            if let Some(files) = &inner.files {
+                files.broker.fail(peer_origin, error);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = error;
+        }
+        Ok(Message::Ping | Message::Pong) => {}
+        Err(e) => log::debug!("discarding clipboard frame: {e}"),
+    }
+}
+
+async fn handle_file_offer(
+    inner: &mut ClipboardInner,
+    peer_origin: [u8; 8],
+    offer: &protocol::FileOffer,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        if !inner.enabled {
+            return;
+        }
+        let self_origin = inner.origin;
+        let Some(uri_item) = inner
+            .files
+            .as_mut()
+            .and_then(|files| files.receiver.accept(peer_origin, self_origin, offer))
+        else {
+            return;
+        };
+        // The URI list is generated locally, so it does not pass through the
+        // backend's normal item-size accumulation. Enforce the same cap here.
+        if uri_item.total_size() > inner.max_item_size {
+            log::warn!(
+                "file sync: generated URI list is {} bytes, over the {} byte cap",
+                uri_item.total_size(),
+                inner.max_item_size
+            );
+            if let Some(files) = inner.files.as_mut() {
+                files.receiver.discard(peer_origin, offer.serial);
+            }
+            return;
+        }
+        // The primary backend must accept the URI list; history sinks are
+        // best effort and do not make a failed file set a success.
+        let mut primary_ok = false;
+        for (index, backend) in inner.backends.iter().enumerate() {
+            match backend.set(&uri_item).await {
+                Ok(()) if index == 0 => primary_ok = true,
+                Ok(()) => {}
+                Err(e) => log::warn!("{} set failed: {e}", backend.name()),
+            }
+        }
+        let Some(files) = inner.files.as_mut() else {
+            return;
+        };
+        if primary_ok {
+            // Suppress the local watcher's echo of this exact URI list.
+            inner.loop_prevention.note_sent(&uri_item);
+            files.receiver.mark_lazy(peer_origin, offer.serial);
+            files.receiver.gc();
+            log::info!(
+                "file sync: accepted lazy offer serial {} from {:02x?}",
+                offer.serial,
+                peer_origin
+            );
+        } else {
+            files.receiver.discard(peer_origin, offer.serial);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (inner, peer_origin, offer);
+    }
+}
+
+async fn handle_file_read(
+    inner: &mut ClipboardInner,
+    peer_origin: [u8; 8],
+    read: protocol::FileRead,
+) {
+    #[cfg(target_os = "linux")]
+    if let Some(files) = &inner.files {
+        let store = files.offers.clone();
+        let tx = inner.direct_tx.clone();
+        let permit = match files.read_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Do not queue unbounded read tasks behind the semaphore. The
+                // requester sees EIO and may retry a chunk later.
+                let response = Message::FileError(protocol::FileError {
+                    request_id: read.request_id,
+                    code: protocol::FILE_ERR_UNAVAILABLE,
+                    message: "sender busy".into(),
+                });
+                if let Ok(frame) = response.encode(0) {
+                    let _ = tx.try_send((peer_origin, frame));
+                }
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let response = store.handle_read(read).await;
+            match response.encode(0) {
+                Ok(frame) => {
+                    let _ = tx.send((peer_origin, frame)).await;
+                }
+                Err(e) => log::warn!("file sync: cannot encode read response: {e}"),
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (inner, peer_origin, read);
     }
 }
 
@@ -217,13 +568,18 @@ mod tests {
     async fn set_enabled_emits_event() {
         let (inbound_tx, inbound_rx) = mpsc::channel(64);
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(64);
+        let (directed_tx, _directed_rx) = mpsc::channel(16);
         let mut clip = Clipboard::new(
-            false,
-            BackendKind::Dummy,
-            DEFAULT_MAX_ITEM_SIZE,
-            [0xAA; 8],
+            ClipboardOptions {
+                enabled: false,
+                backend: BackendKind::Dummy,
+                max_item_size: DEFAULT_MAX_ITEM_SIZE,
+                origin: [0xAA; 8],
+                files: FileOptions::default(),
+            },
             inbound_rx,
             broadcast_tx,
+            directed_tx,
         );
         let _ = inbound_tx;
         clip.set_enabled(true);
@@ -235,20 +591,31 @@ mod tests {
     async fn inbound_frame_is_applied_to_backend() {
         let (inbound_tx, inbound_rx) = mpsc::channel(64);
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(64);
+        let (directed_tx, _directed_rx) = mpsc::channel(16);
         let _clip = Clipboard::new(
-            true,
-            BackendKind::Dummy,
-            DEFAULT_MAX_ITEM_SIZE,
-            [0xAA; 8],
+            ClipboardOptions {
+                enabled: true,
+                backend: BackendKind::Dummy,
+                max_item_size: DEFAULT_MAX_ITEM_SIZE,
+                origin: [0xAA; 8],
+                files: FileOptions::default(),
+            },
             inbound_rx,
             broadcast_tx,
+            directed_tx,
         );
 
         let item = ClipboardItem::text("remote", [0xBB; 8], 1);
         let frame = Message::Announce(item).encode(1024).unwrap();
         let payload = frame[4..].to_vec();
         // Driver applies it without erroring; we just exercise the path.
-        inbound_tx.send(payload).await.unwrap();
+        inbound_tx
+            .send(InboundFrame {
+                origin: [0xBB; 8],
+                payload,
+            })
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
@@ -325,7 +692,7 @@ mod tests {
 
     struct Driver {
         stub: StubBackend,
-        inbound_tx: mpsc::Sender<Vec<u8>>,
+        inbound_tx: mpsc::Sender<InboundFrame>,
         broadcast_rx: mpsc::Receiver<Vec<u8>>,
         _request_tx: mpsc::Sender<ClipboardRequest>,
         _event_rx: mpsc::Receiver<ClipboardEvent>,
@@ -335,6 +702,7 @@ mod tests {
     fn spawn_driver(enabled: bool, origin: [u8; 8]) -> Driver {
         let (inbound_tx, inbound_rx) = mpsc::channel(64);
         let (broadcast_tx, broadcast_rx) = mpsc::channel(64);
+        let (directed_tx, _directed_rx) = mpsc::channel(16);
         let (event_tx, event_rx) = mpsc::channel(16);
         let (request_tx, request_rx) = mpsc::channel(16);
         let stub = StubBackend::new();
@@ -345,6 +713,9 @@ mod tests {
             backends: vec![Box::new(stub.clone())],
             loop_prevention: LoopPrevention::new(origin),
             watcher: None,
+            file_options: FileOptions::default(),
+            direct_tx: directed_tx,
+            files: None,
         };
         let task = tokio::spawn(run_clipboard(
             inner,
@@ -438,7 +809,13 @@ mod tests {
         remote.origin = [0xBB; 8];
         remote.serial = 1;
         let frame = Message::Announce(remote.clone()).encode(1024).unwrap();
-        drv.inbound_tx.send(frame[4..].to_vec()).await.unwrap();
+        drv.inbound_tx
+            .send(InboundFrame {
+                origin: [0xBB; 8],
+                payload: frame[4..].to_vec(),
+            })
+            .await
+            .unwrap();
 
         wait_until(|| drv.stub.set_count() >= 1).await;
         let applied = drv.stub.last_set().expect("applied");
@@ -486,7 +863,13 @@ mod tests {
             reps: vec![("text/plain".into(), b"alt".to_vec())],
         };
         let frame = Message::Announce(echo).encode(1024).unwrap();
-        drv.inbound_tx.send(frame[4..].to_vec()).await.unwrap();
+        drv.inbound_tx
+            .send(InboundFrame {
+                origin: [0xBB; 8],
+                payload: frame[4..].to_vec(),
+            })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert_eq!(
@@ -505,7 +888,13 @@ mod tests {
         let mut drv = spawn_driver(true, [0xAA; 8]);
         let remote = ClipboardItem::text("hi", [0xBB; 8], 1);
         let frame = Message::Announce(remote).encode(1024).unwrap();
-        drv.inbound_tx.send(frame[4..].to_vec()).await.unwrap();
+        drv.inbound_tx
+            .send(InboundFrame {
+                origin: [0xBB; 8],
+                payload: frame[4..].to_vec(),
+            })
+            .await
+            .unwrap();
 
         wait_until(|| drv.stub.set_count() >= 1).await;
         assert_eq!(
@@ -535,7 +924,13 @@ mod tests {
             let payload = format!("random-{}", rng.next());
             let remote = ClipboardItem::text(&payload, [0xBB; 8], 1);
             let frame = Message::Announce(remote).encode(1024).unwrap();
-            drv.inbound_tx.send(frame[4..].to_vec()).await.unwrap();
+            drv.inbound_tx
+                .send(InboundFrame {
+                    origin: [0xBB; 8],
+                    payload: frame[4..].to_vec(),
+                })
+                .await
+                .unwrap();
 
             wait_until(|| drv.stub.set_count() >= 1).await;
             assert_eq!(
@@ -564,7 +959,13 @@ mod tests {
         let drv = spawn_driver(true, [0xAA; 8]);
         let item = ClipboardItem::text("mine", [0xAA; 8], 1);
         let frame = Message::Announce(item).encode(1024).unwrap();
-        drv.inbound_tx.send(frame[4..].to_vec()).await.unwrap();
+        drv.inbound_tx
+            .send(InboundFrame {
+                origin: [0xBB; 8],
+                payload: frame[4..].to_vec(),
+            })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(drv.stub.set_count(), 0, "self-origin must not be applied");
     }
@@ -575,7 +976,13 @@ mod tests {
 
         let remote = ClipboardItem::text("x", [0xBB; 8], 1);
         let frame = Message::Announce(remote).encode(1024).unwrap();
-        drv.inbound_tx.send(frame[4..].to_vec()).await.unwrap();
+        drv.inbound_tx
+            .send(InboundFrame {
+                origin: [0xBB; 8],
+                payload: frame[4..].to_vec(),
+            })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(drv.stub.set_count(), 0, "disabled driver must not apply");
 
@@ -590,13 +997,18 @@ mod tests {
     async fn enable_then_disable_emits_both_events() {
         let (inbound_tx, inbound_rx) = mpsc::channel(64);
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(64);
+        let (directed_tx, _directed_rx) = mpsc::channel(16);
         let mut clip = Clipboard::new(
-            false,
-            BackendKind::Dummy,
-            DEFAULT_MAX_ITEM_SIZE,
-            [0xAA; 8],
+            ClipboardOptions {
+                enabled: false,
+                backend: BackendKind::Dummy,
+                max_item_size: DEFAULT_MAX_ITEM_SIZE,
+                origin: [0xAA; 8],
+                files: FileOptions::default(),
+            },
             inbound_rx,
             broadcast_tx,
+            directed_tx,
         );
         let _ = inbound_tx;
 

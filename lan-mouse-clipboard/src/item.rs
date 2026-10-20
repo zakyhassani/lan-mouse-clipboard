@@ -131,6 +131,35 @@ pub enum ClipboardChange {
     New(ClipboardItem),
 }
 
+/// Normalize a certificate fingerprint to lowercase colon-separated hex.
+///
+/// Returns the input unchanged when it is not exactly 64 hex digits, so
+/// non-fingerprint identifiers used by tests keep their old hashing behavior.
+pub fn canonical_fingerprint(fingerprint: &str) -> String {
+    // Only plain fingerprint spellings are normalized. A value with an
+    // algorithm prefix or other text is returned unchanged instead of
+    // accidentally harvesting hex digits from the prefix.
+    if !fingerprint
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '-' | ' ') || c == '\t')
+    {
+        return fingerprint.to_string();
+    }
+    let hex: String = fingerprint
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if hex.len() != 64 {
+        return fingerprint.to_string();
+    }
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| std::str::from_utf8(pair).expect("hex pair"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// Derive an 8-byte origin id from a certificate fingerprint string.
 ///
 /// The fingerprint is stable and unique per machine (it already gates
@@ -148,6 +177,16 @@ pub fn origin_from_fingerprint(fingerprint: &str) -> [u8; 8] {
 mod tests {
     use super::*;
     use crate::test_util::Rng;
+
+    #[test]
+    fn canonical_fingerprint_normalizes_colon_hex() {
+        let canonical = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+        let upper = canonical.to_ascii_uppercase().replace(':', "");
+        assert_eq!(canonical_fingerprint(&upper), canonical);
+        assert_eq!(canonical_fingerprint(canonical), canonical);
+        assert_eq!(canonical_fingerprint("peer-b"), "peer-b");
+        assert_eq!(canonical_fingerprint("sha256:aa:bb"), "sha256:aa:bb");
+    }
 
     #[test]
     fn origin_from_fingerprint_is_stable_and_unique() {

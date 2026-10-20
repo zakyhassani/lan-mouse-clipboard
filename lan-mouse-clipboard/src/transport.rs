@@ -182,6 +182,15 @@ impl TlsListener {
     }
 }
 
+/// The SHA-256 fingerprint of the certificate presented by the server on an
+/// established client stream. The client does not verify the certificate at
+/// the TLS layer, so callers use this to bind the connection to the expected
+/// peer identity.
+pub fn peer_fingerprint(stream: &ClientStream) -> Option<String> {
+    let cert = stream.get_ref().1.peer_certificates()?.first()?;
+    Some(fingerprint_hex(cert))
+}
+
 /// Connect to a peer's clipboard TLS listener.
 pub async fn connect(
     addr: SocketAddr,
@@ -325,6 +334,11 @@ mod tests {
         let (server_stream, _peer_addr, fp) =
             accept_task.await.expect("accept task").expect("accept");
         assert_eq!(fp, client_fp);
+        let server_fp = server_id.fingerprint();
+        assert_eq!(
+            peer_fingerprint(&client_stream).as_deref(),
+            Some(server_fp.as_str())
+        );
 
         let (mut s_r, mut s_w) = tokio::io::split(server_stream);
         let (mut c_r, mut c_w) = tokio::io::split(client_stream);

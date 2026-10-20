@@ -44,6 +44,32 @@ const MAX_REPS: usize = 16;
 /// targets) while bounding how many large buffers are in flight.
 const READ_CONCURRENCY: usize = 4;
 
+/// File-list MIME types. A selection offering either of them is treated as a
+/// file copy: the URI list becomes the primary rep and images are skipped
+/// (they would only duplicate the same files through the lazy path).
+const MIME_URI_LIST: &str = "text/uri-list";
+const MIME_GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
+
+/// The MIME type without parameters.
+fn base_mime(mime: &str) -> &str {
+    mime.split(';').next().unwrap_or(mime).trim()
+}
+
+/// Whether a MIME type is one of the file-list types we treat as a file copy.
+fn is_file_mime(mime: &str) -> bool {
+    let base = base_mime(mime);
+    base.eq_ignore_ascii_case(MIME_URI_LIST) || base.eq_ignore_ascii_case(MIME_GNOME_COPIED_FILES)
+}
+
+/// Whether a URI list contains at least one `file://` entry.
+fn has_file_uri(data: &[u8]) -> bool {
+    data.split(|b| *b == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line).trim_ascii();
+        line.get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file://"))
+    })
+}
+
 pub struct WlClipboardBackend {
     /// Maximum total item size read from the selection.
     max_item_size: usize,
@@ -119,9 +145,21 @@ fn image_rank(t: &str) -> Option<u8> {
 /// when at least one MIME type is offered (they duplicate the same content),
 /// and used only as a fallback for selections that expose no MIME type.
 pub(crate) fn select_types(raw: &str) -> Vec<String> {
+    select_types_impl(raw, true)
+}
+
+/// Selection without file-copy preference, used when a `text/uri-list` rep
+/// turns out to contain ordinary URLs rather than local files.
+fn select_types_ordinary(raw: &str) -> Vec<String> {
+    select_types_impl(raw, false)
+}
+
+fn select_types_impl(raw: &str, prefer_files: bool) -> Vec<String> {
     let mut mime_text: Vec<(usize, String)> = Vec::new();
     let mut x11_text: Vec<(usize, String)> = Vec::new();
     let mut best_image: Option<(u8, usize, String)> = None;
+    let mut uri_list: Option<(usize, String)> = None;
+    let mut gnome_list: Option<(usize, String)> = None;
     let mut seen: HashSet<String> = HashSet::new();
 
     for (idx, line) in raw.lines().enumerate() {
@@ -129,7 +167,16 @@ pub(crate) fn select_types(raw: &str) -> Vec<String> {
         if t.is_empty() || !is_transferable_type(t) {
             continue;
         }
-        if !seen.insert(canonical_type(t)) {
+        let canonical = canonical_type(t);
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        if prefer_files && base_mime(&canonical).eq_ignore_ascii_case(MIME_URI_LIST) {
+            uri_list = Some((idx, canonical));
+            continue;
+        }
+        if prefer_files && base_mime(&canonical).eq_ignore_ascii_case(MIME_GNOME_COPIED_FILES) {
+            gnome_list = Some((idx, canonical));
             continue;
         }
         if is_text_mime(t) {
@@ -150,6 +197,27 @@ pub(crate) fn select_types(raw: &str) -> Vec<String> {
                 best_image = Some((rank, idx, canonical_type(t)));
             }
         }
+    }
+
+    // A file URI type makes the selection a file copy. Both URI lists are
+    // kept, with `text/uri-list` first so it becomes the primary rep; images
+    // are skipped because the lazy file path already carries the content.
+    if uri_list.is_some() || gnome_list.is_some() {
+        let mut out = Vec::new();
+        if let Some((_, mime)) = uri_list {
+            out.push(mime);
+        }
+        if let Some((_, mime)) = gnome_list {
+            out.push(mime);
+        }
+        let mut text = if mime_text.is_empty() {
+            x11_text
+        } else {
+            mime_text
+        };
+        text.sort_by_key(|(idx, _)| *idx);
+        out.extend(text.into_iter().map(|(_, t)| t));
+        return out;
     }
 
     let mut selected = if mime_text.is_empty() {
@@ -221,9 +289,25 @@ async fn read_selection(max_item_size: usize) -> Option<Vec<ClipboardRep>> {
     if !listed.status.success() {
         return None;
     }
-    let types = select_types(&String::from_utf8_lossy(&listed.stdout));
+    let raw = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let mut types = select_types(&raw);
     if types.is_empty() {
         return None;
+    }
+
+    // A `text/uri-list` rep is only a file copy when it actually lists local
+    // files. Browsers also offer it for ordinary URLs (and for images), so
+    // reading it first avoids turning those copies into file offers.
+    let mut preloaded: Option<ClipboardRep> = None;
+    if types.first().is_some_and(|mime| is_file_mime(mime)) {
+        let mime = types[0].clone();
+        match read_rep(&mime, max_item_size).await {
+            Some(data) if has_file_uri(&data) => {
+                types.remove(0);
+                preloaded = Some((mime, data));
+            }
+            _ => types = select_types_ordinary(&raw),
+        }
     }
 
     // `buffered` keeps the offered order, and each read is individually
@@ -238,6 +322,17 @@ async fn read_selection(max_item_size: usize) -> Option<Vec<ClipboardRep>> {
 
     let mut reps: Vec<ClipboardRep> = Vec::new();
     let mut total = 0usize;
+    if let Some((mime, data)) = preloaded {
+        let size = rep_size(&mime, &data);
+        if size > max_item_size {
+            log::warn!(
+                "clipboard type {mime} is {size} bytes, over the {max_item_size} byte cap; skipping item"
+            );
+            return None;
+        }
+        total += size;
+        reps.push((mime, data));
+    }
     while let Some((mime, data)) = reads.next().await {
         if reps.len() >= MAX_REPS {
             break;
@@ -464,6 +559,66 @@ mod tests {
     fn select_types_reads_only_one_image() {
         let raw = "image/png\nimage/jpeg\nimage/bmp\nimage/tiff\nimage/webp\n";
         assert_eq!(select_types(raw), vec!["image/png".to_string()]);
+    }
+
+    #[test]
+    fn select_types_accepts_parameterized_uri_list() {
+        assert_eq!(
+            select_types("text/uri-list;charset=utf-8\nimage/png\n"),
+            vec!["text/uri-list;charset=utf-8".to_string()]
+        );
+        assert!(is_file_mime("text/uri-list; charset=utf-8"));
+        assert!(is_file_mime("x-special/gnome-copied-files;charset=utf-8"));
+    }
+
+    #[test]
+    fn ordinary_selection_keeps_images_beside_uri_list() {
+        // A browser URL/image copy also advertises text/uri-list, but without
+        // file: entries it must not suppress the image rep.
+        let raw = "text/uri-list\nimage/png\ntext/plain\n";
+        assert_eq!(
+            select_types_ordinary(raw),
+            vec![
+                "text/uri-list".to_string(),
+                "image/png".to_string(),
+                "text/plain".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn file_uri_detection_ignores_http_urls() {
+        assert!(has_file_uri(b"file:///tmp/a\r\n"));
+        assert!(has_file_uri(b"copy\r\nfile://localhost/tmp/a\r\n"));
+        assert!(!has_file_uri(b"https://example.com/a\n"));
+        assert!(!has_file_uri(b"file:relative\n"));
+        assert!(!has_file_uri(b"# comment\n"));
+        assert!(!has_file_uri(b""));
+    }
+
+    #[test]
+    fn select_types_prefers_uri_list_for_file_copies() {
+        let raw = "text/plain\nimage/png\nx-special/gnome-copied-files\ntext/uri-list\n";
+        assert_eq!(
+            select_types(raw),
+            vec![
+                "text/uri-list".to_string(),
+                "x-special/gnome-copied-files".to_string(),
+                "text/plain".to_string(),
+            ],
+            "URI list is primary and the image rep is skipped"
+        );
+    }
+
+    #[test]
+    fn select_types_accepts_gnome_list_alone() {
+        assert_eq!(
+            select_types("x-special/gnome-copied-files\ntext/plain\n"),
+            vec![
+                "x-special/gnome-copied-files".to_string(),
+                "text/plain".to_string()
+            ]
+        );
     }
 
     #[test]
