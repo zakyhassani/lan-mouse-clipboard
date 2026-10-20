@@ -75,3 +75,26 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+
+## Clipboard sync
+
+Clipboard sync is a separate subsystem in the `lan-mouse-clipboard` crate. It
+uses its own TCP/TLS channel on the same port as the UDP input path and runs as
+its own task in the service, independent of capture and emulation. See
+[CLIPBOARD.md](./CLIPBOARD.md) for the transport, wire protocol, backends and
+loop prevention.
+
+On Linux it also supports lazy file and directory copies:
+
+- The sender walks the copied paths (dereferencing symlinks) into an in-memory
+  manifest and broadcasts a `FileOffer` before the normal `Announce`.
+- The receiver creates an in-memory, read-only FUSE generation for the offer and
+  puts local `file://` URIs from that mount on the clipboard.
+- A paste reads 1 MiB chunks on demand through a directed broker request; the
+  sender serves ranges from the remembered offer with `read_at`.
+- If FUSE is unavailable or the offer is rejected, the following `Announce` is
+  applied normally, preserving the old same-path behavior.
+
+File offers are tracked by `(origin, serial)`, not by the existing content-hash
+loop prevention. The receiver also suppresses the local watcher echo of the URI
+list it just set and ignores changes that point back into its own mount.

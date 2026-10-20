@@ -31,6 +31,27 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 </picture>
 
 
+## Clipboard file sync (Linux)
+
+On Linux, copying files or directories can be pasted on another connected host
+with normal Ctrl+V. The receiver gets a read-only, in-memory FUSE view under
+`$XDG_RUNTIME_DIR/lan-mouse/clipboard`:
+
+- Only a metadata manifest (names, sizes, modes, mtimes) is sent at copy time.
+- File bytes are streamed from the sender only when the pasting application
+  reads them (1 MiB chunks, on-demand).
+- The existing `text/uri-list` clipboard item is still sent for compatibility;
+  peers that do not support lazy file sync keep the previous same-path behavior.
+- Symlinks are dereferenced. Ownership, xattrs, ACLs, hardlinks and sparseness
+  are not preserved. A cut is treated as a copy; sender files are never deleted.
+- Lazy receive requires `/dev/fuse` and a working `fusermount3`. Without them,
+  only the legacy URI-list behavior applies.
+- Flatpak/snap applications may not be able to access the mount.
+
+File sync follows the clipboard enable switch and can be disabled with
+`clipboard.file_sync = false` in `config.toml`. See
+[CLIPBOARD.md](./CLIPBOARD.md#lazy-file-and-directory-sync) for details.
+
 ## Encryption
 
 Lan Mouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).

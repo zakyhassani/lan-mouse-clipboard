@@ -24,6 +24,8 @@ pub enum ConnKind {
 struct Entry {
     sink: PeerSink,
     kind: ConnKind,
+    /// Peer identity derived from the authenticated certificate fingerprint.
+    origin: [u8; 8],
     last_used: Instant,
 }
 
@@ -57,12 +59,13 @@ impl ConnectionRegistry {
     }
 
     /// Register or update a connection.
-    pub fn insert(&mut self, addr: SocketAddr, sink: PeerSink, kind: ConnKind) {
+    pub fn insert(&mut self, addr: SocketAddr, origin: [u8; 8], sink: PeerSink, kind: ConnKind) {
         self.peers.insert(
             addr,
             Entry {
                 sink,
                 kind,
+                origin,
                 last_used: Instant::now(),
             },
         );
@@ -84,9 +87,25 @@ impl ConnectionRegistry {
         self.peers.keys().copied().collect()
     }
 
-    /// All live connections with their kind, for reconciliation/pruning.
-    pub fn entries(&self) -> Vec<(SocketAddr, ConnKind)> {
-        self.peers.iter().map(|(addr, e)| (*addr, e.kind)).collect()
+    /// All live connections with their origin and kind, for reconciliation.
+    pub fn entries(&self) -> Vec<(SocketAddr, [u8; 8], ConnKind)> {
+        self.peers
+            .iter()
+            .map(|(addr, e)| (*addr, e.origin, e.kind))
+            .collect()
+    }
+
+    /// Whether a live connection already exists for this peer origin.
+    pub fn contains_origin(&self, origin: [u8; 8]) -> bool {
+        self.peers.values().any(|e| e.origin == origin)
+    }
+
+    /// Address of the live connection for a peer origin, if any.
+    pub fn addr_for_origin(&self, origin: [u8; 8]) -> Option<SocketAddr> {
+        self.peers
+            .iter()
+            .find(|(_, e)| e.origin == origin)
+            .map(|(addr, _)| *addr)
     }
 
     /// Write a frame to a single connection (used for control frames such as
@@ -100,6 +119,22 @@ impl ConnectionRegistry {
             return true;
         }
         self.peers.remove(addr);
+        false
+    }
+
+    /// Write a frame to the connection for one peer origin.
+    ///
+    /// Returns `false` when the peer has no live connection or the write
+    /// failed (a failed connection is removed).
+    pub async fn write_to_origin(&mut self, origin: [u8; 8], frame: &[u8]) -> bool {
+        let Some((addr, entry)) = self.peers.iter_mut().find(|(_, e)| e.origin == origin) else {
+            return false;
+        };
+        let addr = *addr;
+        if write_entry(addr, entry, frame).await {
+            return true;
+        }
+        self.peers.remove(&addr);
         false
     }
 
@@ -160,6 +195,7 @@ mod tests {
             frames.push(b);
             reg.insert(
                 SocketAddr::from(([10, 0, 0, 1], 1000 + frames.len() as u16)),
+                [1; 8],
                 Box::new(a),
                 ConnKind::Incoming,
             );
@@ -182,7 +218,7 @@ mod tests {
         let (a, _b) = duplex();
         drop(_b);
         let addr = SocketAddr::from(([10, 0, 0, 2], 2000));
-        reg.insert(addr, Box::new(a), ConnKind::Incoming);
+        reg.insert(addr, [2; 8], Box::new(a), ConnKind::Incoming);
         let (delivered, removed) = reg.broadcast(b"x").await;
         assert_eq!(delivered, 0);
         assert_eq!(removed, vec![addr]);
@@ -194,10 +230,10 @@ mod tests {
         let mut reg = ConnectionRegistry::new(Duration::from_millis(50));
         let (a1, _b1) = duplex();
         let addr_out = SocketAddr::from(([10, 0, 0, 3], 3000));
-        reg.insert(addr_out, Box::new(a1), ConnKind::Outgoing);
+        reg.insert(addr_out, [3; 8], Box::new(a1), ConnKind::Outgoing);
         let (a2, _b2) = duplex();
         let addr_in = SocketAddr::from(([10, 0, 0, 4], 4000));
-        reg.insert(addr_in, Box::new(a2), ConnKind::Incoming);
+        reg.insert(addr_in, [4; 8], Box::new(a2), ConnKind::Incoming);
 
         tokio::time::sleep(Duration::from_millis(120)).await;
         let evicted = reg.evict_idle();
@@ -207,11 +243,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn directed_write_reaches_only_the_matching_origin() {
+        let mut reg = ConnectionRegistry::new(Duration::from_secs(60));
+        let (a1, mut b1) = duplex();
+        let addr1 = SocketAddr::from(([10, 0, 0, 6], 6000));
+        reg.insert(addr1, [6; 8], Box::new(a1), ConnKind::Outgoing);
+        let (a2, mut b2) = duplex();
+        let addr2 = SocketAddr::from(([10, 0, 0, 7], 7000));
+        reg.insert(addr2, [7; 8], Box::new(a2), ConnKind::Incoming);
+
+        assert!(reg.write_to_origin([7; 8], b"seven").await);
+        let mut buf = [0u8; 5];
+        b2.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"seven");
+        let _ = &mut b1;
+
+        assert!(!reg.write_to_origin([9; 8], b"nobody").await);
+        assert_eq!(reg.addr_for_origin([7; 8]), Some(addr2));
+        assert!(reg.contains_origin([6; 8]));
+        assert!(!reg.contains_origin([9; 8]));
+    }
+
+    #[tokio::test]
     async fn recent_activity_defers_eviction() {
         let mut reg = ConnectionRegistry::new(Duration::from_millis(50));
         let (a, mut b) = duplex();
         let addr = SocketAddr::from(([10, 0, 0, 5], 5000));
-        reg.insert(addr, Box::new(a), ConnKind::Outgoing);
+        reg.insert(addr, [5; 8], Box::new(a), ConnKind::Outgoing);
 
         // Keep sending so last_used stays fresh.
         for _ in 0..6 {

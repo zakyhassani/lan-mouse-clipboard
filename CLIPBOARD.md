@@ -1,8 +1,9 @@
 # Clipboard Sync
 
 Lan Mouse keeps the clipboards of connected machines in sync so that copying
-on one host makes it available to paste on another. Text and images are
-supported; the wire is MIME-agnostic, so other content travels unchanged too.
+on one host makes it available to paste on another. Text, images and (on Linux)
+files and directories are supported. File contents are lazy: only metadata is
+sent at copy time and bytes stream when the paste actually reads them.
 
 > This is our own implementation, added on top of the original Lan Mouse
 > project (see the notice at the top of [README.md](./README.md)).
@@ -22,6 +23,7 @@ prevention, connection handling, and backends.
 - [Transport](#transport)
 - [Wire protocol](#wire-protocol)
 - [Item model](#item-model)
+- [Lazy file and directory sync](#lazy-file-and-directory-sync)
 - [Loop prevention](#loop-prevention)
 - [Connections](#connections)
 - [Live peer resolution](#live-peer-resolution)
@@ -141,6 +143,14 @@ logic on the wire. Each frame is:
 - `Announce (kind = 1)`: share a single clipboard item.
 - `Ping (kind = 2)`: liveness probe (health check).
 - `Pong (kind = 3)`: reply to a `Ping`.
+- `FileOffer (kind = 4)`: announce a lazy file offer (manifest only).
+- `FileRead (kind = 5)`: request one range of an offered file.
+- `FileData (kind = 6)`: answer a `FileRead` with bytes.
+- `FileError (kind = 7)`: answer a `FileRead` with an error.
+
+Kinds 4-7 are additive: older peers reject them as unknown and simply apply the
+following `Announce`, which still carries the sender's original `text/uri-list`.
+Unknown kinds never close a connection.
 
 ```mermaid
 flowchart LR
@@ -175,11 +185,13 @@ for each representation:
 ```
 
 The maximum total item size is `max_item_size` (default
-`DEFAULT_MAX_ITEM_SIZE`, 64 MiB), and a decoded payload is capped at that plus
-a framing margin. `FrameReader` accumulates raw stream bytes and splits them
-back into complete payloads, handling frames that span multiple reads as well
-as several frames within one read. Malformed lengths are rejected and the
-reader resynchronizes on the next length prefix.
+`DEFAULT_MAX_ITEM_SIZE`, 64 MiB), and a decoded `Announce` payload is capped at
+that plus a framing margin. File frames are independent of `max_item_size`:
+`FileOffer` is bounded by the configured manifest cap, and one `FileRead` or
+`FileData` carries at most 1 MiB. `FrameReader` accumulates raw stream bytes and
+splits them back into complete payloads, handling frames that span multiple
+reads as well as several frames within one read. Malformed lengths are rejected
+and the reader resynchronizes on the next length prefix.
 
 ## Item model
 
@@ -254,6 +266,126 @@ Sizes are bounded by `max_item_size` (see
 [Configuration & enabling](#configuration--enabling)): representations are
 added in order until the cap is reached, and an item whose primary
 representation alone exceeds the cap is dropped with a warning.
+
+## Lazy file and directory sync
+
+Linux only. Copying files or directories on one host makes them pasteable on
+another with normal Ctrl+V in a file manager or any app that accepts a file
+paste. Only metadata travels at copy time. File bytes are fetched when the
+Paste reads them, through a read-only FUSE view on the receiver.
+
+### Sender
+
+A file copy is still an ordinary clipboard item whose reps include
+`text/uri-list` (and usually `x-special/gnome-copied-files`). The wl-clipboard
+backend picks those types up, prefers `text/uri-list` as the primary rep, and
+skips image reps when the URI list actually contains local `file:` URIs. A
+browser URL in `text/uri-list` is treated as an ordinary text copy.
+
+1. The driver stamps `origin` and `serial`, runs loop prevention, and queues
+   the item to one manifest build worker. Non-file items broadcast immediately.
+2. The worker parses the URI list, dereferences symlinks, walks directories,
+   tracks visited `(st_dev, st_ino)` pairs for cycle detection, and collects
+   file/dir metadata into a manifest capped by `file_manifest_max_entries` and
+   `file_manifest_max_bytes` (defaults 100,000 entries and 16 MiB).
+3. The driver broadcasts `FileOffer` first, then the normal `Announce`. TCP
+   ordering keeps the two frames in order per connection. If the manifest build
+   fails or exceeds a cap, only the `Announce` is sent.
+4. The last 8 offers (64 MiB of manifests total) are retained for reads. Each
+   `FileRead` is validated against the offered serial, entry id, offset and
+   length, and served with `read_at` in `spawn_blocking`. A semaphore limits a
+   sender to 8 concurrent reads.
+
+A cut is treated as a copy; sender files are never deleted. Symlinks are
+dereferenced, so a manifest can expose targets outside the selected tree if the
+daemon user can read them. Ownership, xattrs, ACLs, hardlinks and sparseness are
+not preserved. Unix rwx bits and mtime are preserved, with setuid, setgid and
+sticky bits cleared.
+
+### Receiver
+
+1. On `FileOffer`, the receiver verifies the source origin against the
+   authenticated connection, rejects self-origin and duplicate offers, checks
+   the protocol version, and validates the manifest limits, names and tree.
+2. It creates an in-memory FUSE generation for `(origin, serial)` with unique
+   top-level names (` (2)`, ` (3)` on collision).
+3. It sets the clipboard through the primary backend with one `text/uri-list`
+   rep listing `file://` URIs inside the mount.
+4. The offer is marked lazy. If the primary set fails, the generation is
+   removed and the marker is not set.
+5. The following `Announce` with the same `(origin, serial)` is skipped when the
+   lazy marker exists, so the old same-path behavior does not overwrite the
+   view. Otherwise it is applied normally, which is the fallback for old
+   senders, unsupported FUSE, invalid offers and oversized manifests.
+6. The last 4 generations or 64 MiB of manifests are kept. Closed
+   generations are evicted oldest-first; open ones are skipped, and the newest
+   generation (the one currently on the clipboard) is never evicted. The mount
+   root is never removed.
+
+### Paste path
+
+1. The file manager opens a file in the mount and issues a normal read.
+2. FUSE maps `(generation, entry id)` to a 1 MiB chunk in a 64 MiB LRU cache.
+3. On a miss, the broker allocates a request id, sends a directed `FileRead` to
+   the offer's origin peer, and waits up to 15 seconds.
+4. The sender answers with directed `FileData` (or `FileError`).
+5. The broker checks the answering connection's origin, FUSE caches the chunk,
+   and the requested subrange is returned. Errors and timeouts map to `EIO`; a
+   later read can succeed after the reconnect loop restores the channel.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FM as File manager (receiver)
+    participant F as FUSE view
+    participant B as Broker (receiver)
+    participant N as Network task
+    participant S as Sender driver
+    participant D as Local disk (sender)
+
+    FM->>F: open + read(path, offset, size)
+    F->>F: chunk cache miss
+    F->>B: read(origin, serial, entry, chunk)
+    B->>N: directed FileRead
+    N->>S: FileRead
+    S->>D: read_at(path, offset, len)
+    D-->>S: bytes
+    S->>N: directed FileData
+    N->>B: FileData
+    B->>F: complete request
+    F->>F: cache 1 MiB chunk
+    F-->>FM: requested subrange
+```
+
+### FUSE view and safety
+
+- Mount point: `$XDG_RUNTIME_DIR/lan-mouse/clipboard`, mode 0700. Missing
+  `XDG_RUNTIME_DIR` disables lazy receive.
+- The mount is created once per daemon when clipboard sync and `file_sync` are
+  enabled (or on the first enable). A stale mount is cleared with
+  `fusermount3 -u -z` before mounting; a non-empty directory disables the view.
+- Options: read-only, `nosuid`, `nodev`, `fsname=lan-mouse`, owner-only ACL,
+  4 worker threads. `allow_other` and `default_permissions` are not used.
+- Inodes: root `1`, generation directory `(gen << 32) | 0xFFFF_FFFF`, entries
+  `(gen << 32) | entry_id`. Reported modes are the source rwx bits; uid/gid are
+  the daemon user. mtime and size come from the manifest.
+- Only manifest entry ids are readable. A path is never accepted from the peer.
+  Names are single components, not `.`/`..`, NUL-free, at most 255 bytes.
+- All write, create, delete, rename, setattr and truncate operations return
+  `EROFS`.
+- The view is in-memory only. A daemon restart drops the mount and breaks old
+  clipboard paths. Sender restart or offer eviction breaks old paths too.
+- Flatpak/snap apps may not see the mount; portal support is out of scope.
+
+### Loop prevention for files
+
+- Setting the FUSE URI list hashes the exact `text/uri-list` rep and suppresses
+  the next local watcher change with that hash.
+- Local clipboard changes whose parsed top-level paths are all inside the mount
+  are ignored, so the view is never re-exported.
+- File offers are not run through `LoopPrevention` content dedup; they are
+  tracked by `(origin, serial)` in the receiver. The legacy `Announce` still
+  uses the existing rep-hash history.
 
 ## Loop prevention
 
@@ -482,6 +614,12 @@ backend = "auto"
 # total size cap for a single item (all representations combined), in bytes
 # default 64 MiB; clamped to [1 KiB, 256 MiB]
 max_item_size = 67108864
+# lazy file/directory sync (Linux); defaults to true when clipboard sync is on
+file_sync = true
+# maximum manifest entries per file offer; clamped to [1, 1000000]
+file_manifest_max_entries = 100000
+# maximum encoded manifest size; clamped to [1 MiB, 64 MiB]
+file_manifest_max_bytes = 16777216
 ```
 
 It can be toggled at runtime from the GTK frontend or the CLI. Enabling/disabling
@@ -494,6 +632,10 @@ the local backend reads and encodes, and it caps the payload the network task
 accepts. There is no negotiation, so **set the same value on every host**;
 a peer configured larger can send items a smaller peer rejects. The clamped
 range is `[1 KiB, 256 MiB]`.
+
+`file_sync` follows the clipboard enable switch. When it is disabled (or FUSE
+is unavailable), only the ordinary `text/uri-list` `Announce` is used, which
+keeps the previous same-path behavior on the receiving host.
 
 No extra ports or firewall rules are needed beyond the ones lan-mouse already
 uses, because the clipboard channel shares the same UDP/TCP port.

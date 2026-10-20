@@ -33,9 +33,17 @@ pub struct LoopPrevention {
 
 impl LoopPrevention {
     pub fn new(self_origin: [u8; 8]) -> Self {
+        // Seed the serial from wall-clock nanoseconds so a restarted process
+        // does not reuse offer serials. File offers are identified by
+        // `(origin, serial)` on the receiver; starting again at 1 would make
+        // a new session's offers collide with remembered old ones.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         Self {
             self_origin,
-            serial: 0,
+            serial: seed,
             last_local_hash: None,
             last_remote_hash: None,
             pending_suppress: None,
@@ -123,6 +131,34 @@ mod tests {
 
     fn remote_item(origin: [u8; 8], text: &str, serial: u64) -> ClipboardItem {
         ClipboardItem::text(text, origin, serial)
+    }
+
+    #[test]
+    fn file_uri_item_is_not_rebroadcast_and_remote_echo_is_dropped() {
+        let uri = ClipboardItem {
+            origin: A,
+            serial: 7,
+            reps: vec![(
+                "text/uri-list".to_string(),
+                b"file:///run/user/1000/lan-mouse/clipboard/a-1/f\r\n".to_vec(),
+            )],
+        };
+        let mut lp = LoopPrevention::new(A);
+        lp.note_sent(&uri);
+        assert!(
+            !lp.on_local_change(&uri),
+            "the watcher echo of a receiver-set URI list must be suppressed"
+        );
+
+        let echo_from_peer = ClipboardItem {
+            origin: B,
+            serial: 9,
+            reps: uri.reps.clone(),
+        };
+        assert!(
+            !lp.should_apply_remote(&echo_from_peer),
+            "a peer echoing the URI list must not be applied again"
+        );
     }
 
     #[test]

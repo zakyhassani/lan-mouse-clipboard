@@ -80,12 +80,31 @@ struct ClipboardConfig {
     backend: Option<BackendKind>,
     /// total size cap for a single clipboard item, in bytes
     max_item_size: Option<usize>,
+    /// enable lazy file transfer (metadata first, bytes on demand)
+    file_sync: Option<bool>,
+    /// maximum number of manifest entries for one file offer
+    file_manifest_max_entries: Option<usize>,
+    /// maximum encoded manifest size for one file offer, in bytes
+    file_manifest_max_bytes: Option<usize>,
 }
 
 /// Clamp a configured clipboard item size to the supported range so a bad
 /// value cannot cause unbounded allocations.
 fn clamp_clipboard_item_size(configured: usize) -> usize {
     configured.clamp(1024, lan_mouse_clipboard::MAX_ITEM_SIZE_LIMIT)
+}
+
+/// Clamp a configured manifest entry cap to the supported range.
+fn clamp_manifest_entries(configured: usize) -> usize {
+    configured.clamp(1, lan_mouse_clipboard::MAX_FILE_MANIFEST_MAX_ENTRIES)
+}
+
+/// Clamp a configured manifest byte cap to `[1 MiB, 64 MiB]`.
+fn clamp_manifest_bytes(configured: usize) -> usize {
+    configured.clamp(
+        1024 * 1024,
+        lan_mouse_clipboard::MAX_FILE_MANIFEST_MAX_BYTES,
+    )
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -515,6 +534,50 @@ impl Config {
         clamp_clipboard_item_size(configured)
     }
 
+    /// whether lazy file sync is enabled
+    ///
+    /// Defaults to true: when clipboard sync is turned on, file offers are
+    /// enabled too unless the config explicitly disables them.
+    pub fn clipboard_file_sync(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard.as_ref())
+            .and_then(|cb| cb.file_sync)
+            .unwrap_or(true)
+    }
+
+    /// maximum number of manifest entries for one file offer
+    pub fn clipboard_file_manifest_max_entries(&self) -> usize {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard.as_ref())
+            .and_then(|cb| cb.file_manifest_max_entries)
+            .map(clamp_manifest_entries)
+            .unwrap_or(lan_mouse_clipboard::DEFAULT_FILE_MANIFEST_MAX_ENTRIES)
+    }
+
+    /// maximum encoded manifest size for one file offer, in bytes
+    pub fn clipboard_file_manifest_max_bytes(&self) -> usize {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard.as_ref())
+            .and_then(|cb| cb.file_manifest_max_bytes)
+            .map(clamp_manifest_bytes)
+            .unwrap_or(lan_mouse_clipboard::DEFAULT_FILE_MANIFEST_MAX_BYTES)
+    }
+
+    /// lazy file-sync settings
+    ///
+    /// The caps are clamped so a bad config value cannot cause unbounded
+    /// memory use.
+    pub fn clipboard_file_options(&self) -> lan_mouse_clipboard::FileOptions {
+        lan_mouse_clipboard::FileOptions {
+            enabled: self.clipboard_file_sync(),
+            max_entries: self.clipboard_file_manifest_max_entries(),
+            max_manifest_bytes: self.clipboard_file_manifest_max_bytes(),
+        }
+    }
+
     /// optional input-capture backend override
     pub fn capture_backend(&self) -> Option<CaptureBackend> {
         self.args
@@ -670,5 +733,37 @@ mod tests {
         let cb = toml.clipboard.expect("clipboard");
         assert_eq!(cb.enabled, Some(true));
         assert_eq!(cb.max_item_size, Some(33_554_432));
+    }
+
+    #[test]
+    fn clipboard_config_parses_file_sync_options() {
+        let toml: ConfigToml = toml::from_str(
+            r#"
+            [clipboard]
+            enabled = true
+            file_sync = false
+            file_manifest_max_entries = 500
+            file_manifest_max_bytes = 8388608
+            "#,
+        )
+        .expect("parse");
+        let cb = toml.clipboard.expect("clipboard");
+        assert_eq!(cb.file_sync, Some(false));
+        assert_eq!(cb.file_manifest_max_entries, Some(500));
+        assert_eq!(cb.file_manifest_max_bytes, Some(8_388_608));
+    }
+
+    #[test]
+    fn file_manifest_limits_are_clamped() {
+        assert_eq!(clamp_manifest_entries(0), 1);
+        assert_eq!(
+            clamp_manifest_entries(usize::MAX),
+            lan_mouse_clipboard::MAX_FILE_MANIFEST_MAX_ENTRIES
+        );
+        assert_eq!(clamp_manifest_bytes(0), 1024 * 1024);
+        assert_eq!(
+            clamp_manifest_bytes(usize::MAX),
+            lan_mouse_clipboard::MAX_FILE_MANIFEST_MAX_BYTES
+        );
     }
 }

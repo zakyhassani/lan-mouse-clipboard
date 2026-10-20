@@ -750,27 +750,40 @@ async fn setup_clipboard(
     Option<tokio::task::JoinHandle<()>>,
     tokio::sync::watch::Sender<Vec<network::PeerEndpoints>>,
 ) {
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(64);
-    let (broadcast_tx, broadcast_rx) = tokio::sync::mpsc::channel(64);
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
+    let (broadcast_tx, broadcast_rx) = tokio::sync::mpsc::channel(16);
+    let (directed_tx, directed_rx) = tokio::sync::mpsc::channel(16);
     let origin = lan_mouse_clipboard::item::origin_from_fingerprint(public_key_fingerprint);
     let max_item_size = config.clipboard_max_item_size();
-    let clipboard = lan_mouse_clipboard::Clipboard::new(
-        config.clipboard_enabled(),
-        config.clipboard_backend(),
+    let options = lan_mouse_clipboard::ClipboardOptions {
+        enabled: config.clipboard_enabled(),
+        backend: config.clipboard_backend(),
         max_item_size,
         origin,
-        inbound_rx,
-        broadcast_tx,
-    );
+        files: config.clipboard_file_options(),
+    };
+    let clipboard =
+        lan_mouse_clipboard::Clipboard::new(options, inbound_rx, broadcast_tx, directed_tx);
     // The clipboard network task re-reads this channel every reconnect tick,
     // so peer addresses (and their live IPs) can change without a restart.
     let (peers_tx, peers_rx) =
         tokio::sync::watch::channel::<Vec<network::PeerEndpoints>>(Vec::new());
     let task = match setup_clipboard_network(
         config,
-        max_item_size,
-        inbound_tx,
-        broadcast_rx,
+        network::NetworkChannels {
+            inbound: inbound_tx,
+            broadcast: broadcast_rx,
+            directed: directed_rx,
+        },
+        network::NetworkLimits {
+            max_item_size,
+            // Frame at the absolute manifest cap, not this host's configured
+            // receive cap: an oversized offer must still reach the driver so
+            // its stricter decode rejects it and the following Announce is
+            // applied instead of being lost during a frame resync.
+            max_manifest_bytes: lan_mouse_clipboard::MAX_FILE_MANIFEST_MAX_BYTES,
+            idle_timeout: std::time::Duration::from_secs(60),
+        },
         peers_rx,
         events_tx,
     )
@@ -791,9 +804,8 @@ async fn setup_clipboard(
 /// Bind the clipboard TLS listener and spawn the network task.
 async fn setup_clipboard_network(
     config: &Config,
-    max_item_size: usize,
-    inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    broadcast_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    channels: network::NetworkChannels,
+    limits: network::NetworkLimits,
     peers_rx: tokio::sync::watch::Receiver<Vec<network::PeerEndpoints>>,
     events_tx: tokio::sync::mpsc::Sender<network::NetworkEvent>,
 ) -> Result<tokio::task::JoinHandle<()>, transport::TransportError> {
@@ -810,12 +822,8 @@ async fn setup_clipboard_network(
         listener,
         client_config,
         peers_rx,
-        inbound_tx,
-        broadcast_rx,
-        network::NetworkLimits {
-            max_item_size,
-            idle_timeout: std::time::Duration::from_secs(60),
-        },
+        channels,
+        limits,
         events_tx,
     ));
     Ok(task)
@@ -852,9 +860,12 @@ fn resolve_clipboard_peers(
                 .hostname
                 .as_deref()
                 .and_then(|h| name_to_fp.get(h))
-                .copied();
-            let initiates = peer_fp.is_some_and(|fp| my_fp > fp);
-            if !initiates {
+                .copied()?;
+            // Compare canonical spellings so uppercase or colonless config
+            // fingerprints cannot make both peers believe they initiate.
+            let my_canonical = lan_mouse_clipboard::item::canonical_fingerprint(my_fp);
+            let peer_canonical = lan_mouse_clipboard::item::canonical_fingerprint(peer_fp);
+            if my_canonical <= peer_canonical {
                 return None;
             }
             // Exactly one active endpoint per peer: the live UDP-path IP when
@@ -873,7 +884,10 @@ fn resolve_clipboard_peers(
                 .map(|ip| SocketAddr::new(*ip, c.port))
                 .collect();
             Some(network::PeerEndpoints {
-                id: peer_fp.unwrap_or_default().to_string(),
+                id: peer_fp.to_string(),
+                origin: lan_mouse_clipboard::item::origin_from_fingerprint(
+                    &lan_mouse_clipboard::item::canonical_fingerprint(peer_fp),
+                ),
                 active,
                 fallbacks,
             })
