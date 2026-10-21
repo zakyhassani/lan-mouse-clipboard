@@ -104,9 +104,11 @@ list it just set and ignores changes that point back into its own mount.
 The Windows backend owns one clipboard worker thread with an OLE STA message
 loop. Local text, images and `CF_HDROP` file lists are polled through the Win32
 clipboard. A received file offer becomes an `IDataObject` with
-`CFSTR_FILEDESCRIPTORW`/`CFSTR_FILECONTENTS`; each file is a lazy `IStream` that
-requests 1 MiB chunks through the broker. Directory trees use relative
-`cFileName` paths and empty directories use directory descriptors. Names that
+`CFSTR_FILEDESCRIPTORW`/`CFSTR_FILECONTENTS`, `CFSTR_FILENAMEW`/`A` and
+`CF_HDROP`; each file is a lazy `IStream` that requests 1 MiB chunks through the
+broker. Directory trees use relative `cFileName` paths and empty directories
+use directory descriptors. The first `CF_HDROP` request materializes the whole
+offer under `%TEMP%\lan-mouse-clipboard` and returns top-level cache paths, so
+Explorer can paste; the cache is cleared on the next daemon start. Names that
 Windows cannot represent reject the whole offer. Remote URI lists are rejected
-rather than converted into local paths; apps that only accept `CF_HDROP` do not
-support remote virtual files.
+rather than converted directly into local paths.

@@ -1,6 +1,8 @@
 //! OLE virtual-file clipboard object for received file offers.
 
+use std::io::Write;
 use std::mem::ManuallyDrop;
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
@@ -19,6 +21,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Ole::CF_HDROP;
 use windows::Win32::UI::Shell::{
     FD_ATTRIBUTES, FD_FILESIZE, FD_UNICODE, FD_WRITESTIME, FILEDESCRIPTORW, SHCreateStdEnumFmtEtc,
 };
@@ -35,6 +38,9 @@ pub struct VirtualDataObject {
     files: Arc<RemoteFileSet>,
     descriptor_format: u16,
     contents_format: u16,
+    file_name_w_format: u16,
+    file_name_a_format: u16,
+    hdrop_cache: Mutex<Option<PathBuf>>,
 }
 
 impl VirtualDataObject {
@@ -42,10 +48,152 @@ impl VirtualDataObject {
         let descriptor_format =
             unsafe { RegisterClipboardFormatW(w!("FileGroupDescriptorW")) } as u16;
         let contents_format = unsafe { RegisterClipboardFormatW(w!("FileContents")) } as u16;
+        let file_name_w_format = unsafe { RegisterClipboardFormatW(w!("FileNameW")) } as u16;
+        let file_name_a_format = unsafe { RegisterClipboardFormatW(w!("FileNameA")) } as u16;
         Self {
             files,
             descriptor_format,
             contents_format,
+            file_name_w_format,
+            file_name_a_format,
+            hdrop_cache: Mutex::new(None),
+        }
+    }
+
+    /// Materialize the whole offer into a per-offer temp directory on first
+    /// CF_HDROP request. Explorer's Paste only accepts CF_HDROP, so the lazy
+    /// OLE stream is not enough there; users still pay only when they paste.
+    fn ensure_materialized(&self) -> Result<PathBuf, Error> {
+        let mut cache = self
+            .hdrop_cache
+            .lock()
+            .map_err(|_| Error::from_hresult(E_FAIL))?;
+        if let Some(path) = cache.as_ref() {
+            return Ok(path.clone());
+        }
+        let origin: String = self
+            .files
+            .origin
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let base = std::env::temp_dir()
+            .join("lan-mouse-clipboard")
+            .join(format!("{origin}-{}", self.files.serial));
+        std::fs::create_dir_all(&base).map_err(|e| {
+            log::warn!("windows clipboard: cannot create {}: {e}", base.display());
+            Error::from_hresult(E_FAIL)
+        })?;
+        for entry in &self.files.entries {
+            let relative = String::from_utf16_lossy(&entry.relative);
+            let path = base.join(&relative);
+            if entry.is_dir {
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    log::warn!("windows clipboard: cannot create {}: {e}", path.display());
+                    return Err(Error::from_hresult(E_FAIL));
+                }
+                continue;
+            }
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut file = std::fs::File::create(&path).map_err(|e| {
+                log::warn!("windows clipboard: cannot create {}: {e}", path.display());
+                Error::from_hresult(E_FAIL)
+            })?;
+            let mut offset = 0u64;
+            while offset < entry.size {
+                let want = (entry.size - offset).min(READ_CHUNK_SIZE as u64) as u32;
+                let data = self
+                    .files
+                    .runtime
+                    .block_on(self.files.broker.read(
+                        self.files.origin,
+                        self.files.serial,
+                        entry.id,
+                        offset,
+                        want,
+                    ))
+                    .map_err(|e| {
+                        log::warn!(
+                            "windows clipboard: materializing entry {} at {offset} failed: {e}",
+                            entry.id
+                        );
+                        Error::from_hresult(E_FAIL)
+                    })?;
+                if data.is_empty() {
+                    break;
+                }
+                file.write_all(&data).map_err(|e| {
+                    log::warn!("windows clipboard: write {} failed: {e}", path.display());
+                    Error::from_hresult(E_FAIL)
+                })?;
+                offset += data.len() as u64;
+            }
+        }
+        *cache = Some(base.clone());
+        log::debug!(
+            "windows clipboard: materialized offer {} at {}",
+            self.files.serial,
+            base.display()
+        );
+        Ok(base)
+    }
+
+    fn hdrop_bytes(&self, base: &std::path::Path) -> Result<Vec<u8>, Error> {
+        let mut paths = Vec::new();
+        for entry in &self.files.entries {
+            // Only top-level entries: Explorer copies directories recursively
+            // from the materialized tree.
+            if entry.relative.contains(&(b'\\' as u16)) {
+                continue;
+            }
+            let relative = String::from_utf16_lossy(&entry.relative);
+            paths.push(base.join(relative));
+        }
+        if paths.is_empty() {
+            return Err(Error::from_hresult(E_FAIL));
+        }
+        // DROPFILES is 20 bytes at the fixed Windows ABI.
+        let header = 20usize;
+        let mut bytes = vec![0u8; header];
+        bytes[0..4].copy_from_slice(&(header as u32).to_le_bytes());
+        bytes[16..20].copy_from_slice(&1i32.to_le_bytes()); // fWide
+        for path in &paths {
+            use std::os::windows::ffi::OsStrExt;
+            for unit in path.as_os_str().encode_wide() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        Ok(bytes)
+    }
+
+    fn entry(&self, index: i32) -> Result<&VirtualEntry, Error> {
+        if index < 0 {
+            return Err(Error::from_hresult(DV_E_LINDEX));
+        }
+        self.files
+            .entries
+            .get(index as usize)
+            .ok_or_else(|| Error::from_hresult(DV_E_LINDEX))
+    }
+
+    fn file_name_bytes(&self, index: i32, wide: bool) -> Result<Vec<u8>, Error> {
+        let entry = self.entry(index)?;
+        if wide {
+            let mut bytes = Vec::with_capacity((entry.relative.len() + 1) * 2);
+            for unit in &entry.relative {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            Ok(bytes)
+        } else {
+            let name = String::from_utf16_lossy(&entry.relative);
+            let mut bytes = name.into_bytes();
+            bytes.push(0);
+            Ok(bytes)
         }
     }
 
@@ -163,12 +311,46 @@ impl IDataObject_Impl for VirtualDataObject_Impl {
             if format.tymed & TYMED_ISTREAM.0 as u32 == 0 {
                 return Err(Error::from_hresult(DV_E_FORMATETC));
             }
+            log::debug!(
+                "windows clipboard: FileContents requested for index {}",
+                format.lindex
+            );
             let stream = self.entry_stream(format.lindex)?;
             return Ok(STGMEDIUM {
                 tymed: TYMED_ISTREAM.0 as u32,
                 u: STGMEDIUM_0 {
                     pstm: ManuallyDrop::new(Some(stream)),
                 },
+                pUnkForRelease: ManuallyDrop::new(None),
+            });
+        }
+        if format.cfFormat == CF_HDROP.0 {
+            if format.tymed & TYMED_HGLOBAL.0 as u32 == 0 {
+                return Err(Error::from_hresult(DV_E_FORMATETC));
+            }
+            let base = self.ensure_materialized()?;
+            let memory = alloc_hglobal(&self.hdrop_bytes(&base)?)?;
+            return Ok(STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: memory },
+                pUnkForRelease: ManuallyDrop::new(None),
+            });
+        }
+        let file_name = if format.cfFormat == self.file_name_w_format {
+            Some(true)
+        } else if format.cfFormat == self.file_name_a_format {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(wide) = file_name {
+            if format.tymed & TYMED_HGLOBAL.0 as u32 == 0 {
+                return Err(Error::from_hresult(DV_E_FORMATETC));
+            }
+            let memory = alloc_hglobal(&self.file_name_bytes(format.lindex, wide)?)?;
+            return Ok(STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: memory },
                 pUnkForRelease: ManuallyDrop::new(None),
             });
         }
@@ -201,6 +383,24 @@ impl IDataObject_Impl for VirtualDataObject_Impl {
                 }
             }
             return DV_E_LINDEX;
+        }
+        if format.cfFormat == CF_HDROP.0 {
+            return if format.tymed & TYMED_HGLOBAL.0 as u32 != 0 {
+                HRESULT(0)
+            } else {
+                DV_E_FORMATETC
+            };
+        }
+        if format.cfFormat == self.file_name_w_format || format.cfFormat == self.file_name_a_format
+        {
+            if format.tymed & TYMED_HGLOBAL.0 as u32 == 0 {
+                return DV_E_FORMATETC;
+            }
+            return if self.entry(format.lindex).is_ok() {
+                HRESULT(0)
+            } else {
+                DV_E_LINDEX
+            };
         }
         DV_E_FORMATETC
     }
@@ -248,7 +448,28 @@ impl IDataObject_Impl for VirtualDataObject_Impl {
             tymed: TYMED_ISTREAM.0 as u32,
             ..Default::default()
         };
-        unsafe { SHCreateStdEnumFmtEtc(&[descriptor, contents]) }
+        let file_name_w = FORMATETC {
+            cfFormat: self.file_name_w_format,
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+            ..Default::default()
+        };
+        let file_name_a = FORMATETC {
+            cfFormat: self.file_name_a_format,
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+            ..Default::default()
+        };
+        let hdrop = FORMATETC {
+            cfFormat: CF_HDROP.0,
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+            ..Default::default()
+        };
+        unsafe { SHCreateStdEnumFmtEtc(&[descriptor, contents, file_name_w, file_name_a, hdrop]) }
     }
 
     fn DAdvise(
@@ -347,6 +568,10 @@ impl VirtualStream {
                         data
                     } else {
                         let want = (self.size - chunk_start).min(chunk_size) as u32;
+                        log::debug!(
+                            "windows clipboard: fetching entry {} offset {chunk_start} len {want}",
+                            self.entry_id
+                        );
                         let data = self
                             .files
                             .runtime
@@ -715,5 +940,33 @@ mod tests {
             .take_while(|unit| *unit != 0)
             .collect();
         assert_eq!(String::from_utf16(&name).unwrap(), "dir\\file.txt");
+    }
+
+    #[tokio::test]
+    async fn hdrop_lists_only_top_level_entries() {
+        let object = VirtualDataObject::new(files());
+        let base = std::path::Path::new("C:\\cache");
+        let bytes = object.hdrop_bytes(base).unwrap();
+        assert_eq!(bytes[0..4], 20u32.to_le_bytes());
+        assert_eq!(bytes[16..20], 1i32.to_le_bytes());
+        let units: Vec<u16> = bytes[20..]
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let list = String::from_utf16(&units).unwrap();
+        assert_eq!(list, "C:\\cache\\dir\0\0");
+    }
+
+    #[tokio::test]
+    async fn file_name_is_null_terminated_per_index() {
+        let object = VirtualDataObject::new(files());
+        let wide = object.file_name_bytes(1, true).unwrap();
+        let units: Vec<u16> = wide
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), "dir\\file.txt\0");
+        let ansi = object.file_name_bytes(0, false).unwrap();
+        assert_eq!(ansi, b"dir\0");
     }
 }

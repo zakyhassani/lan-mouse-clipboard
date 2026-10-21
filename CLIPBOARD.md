@@ -394,11 +394,18 @@ Windows uses native OLE virtual files instead of FUSE:
 - A local file copy is read from `CF_HDROP`, converted to a `text/uri-list`
   item, and offered through the normal `FileOffer`/`Announce` flow.
 - A received `FileOffer` is validated for Windows names and installed as an
-  `IDataObject` with `CFSTR_FILEDESCRIPTORW` and `CFSTR_FILECONTENTS`.
-  Directory trees are represented by relative paths in `cFileName`; empty
-  directories use `FILE_ATTRIBUTE_DIRECTORY` descriptors.
-- Each file is a lazy `IStream`; a read fetches 1 MiB chunks from the sender.
-  Nothing is downloaded at copy time.
+  `IDataObject` with `CFSTR_FILEDESCRIPTORW`, `CFSTR_FILECONTENTS`,
+  `CFSTR_FILENAMEW`/`CFSTR_FILENAMEA` and `CF_HDROP`. Directory trees are
+  represented by relative paths in `cFileName`; empty directories use
+  `FILE_ATTRIBUTE_DIRECTORY` descriptors.
+- OLE-aware consumers can read each file lazily as an `IStream`; a read
+  fetches 1 MiB chunks from the sender.
+- Explorer and other apps that only paste `CF_HDROP` need local paths. The
+  first `CF_HDROP` request materializes the whole offer under
+  `%TEMP%\lan-mouse-clipboard\<origin>-<serial>` and returns the top-level
+  paths, so that paste downloads every file before it starts copying. Nothing
+  is downloaded at clipboard-set time, but the first `CF_HDROP` request is
+  synchronous and eager. The cache is cleared when the daemon next starts.
 - Names are rejected rather than renamed if they contain Windows-invalid
   characters, reserved device names, a trailing dot or space, a relative path
   over 259 UTF-16 units, or case-insensitive sibling collisions. Non-UTF8
@@ -409,9 +416,9 @@ Windows uses native OLE virtual files instead of FUSE:
 - The OLE data object lives in the daemon. If the daemon exits, old virtual
   clipboard items can no longer be pasted. The sender keeps only its last 8
   offers; evicting them breaks outstanding paste streams.
-- Apps that only accept `CF_HDROP` will not paste remote virtual files; OLE-aware
-  apps (Explorer, Word, many editors) do. This is the main Windows compatibility
-  limitation.
+- Clipboard format ordering is not controlled by lan-mouse. Apps that prefer
+  `CF_HDROP` (including Explorer) pay the full materialization cost on paste;
+  apps that prefer the OLE formats stay lazy.
 - Text is preferred over an accompanying bitmap; image-only copies use PNG,
   CF_DIBV5 and CF_DIB. Images are decoded with limits to avoid decompression
   bombs. ACLs, ADS, hidden/system attributes and hardlinks are not preserved.
@@ -666,8 +673,9 @@ range is `[1 KiB, 256 MiB]`.
 
 `file_sync` follows the clipboard enable switch. On Linux, disabling it (or
 missing FUSE) leaves only the ordinary `text/uri-list` `Announce`. On Windows,
-file paste requires the `windows` backend and OLE virtual files; remote URI
-lists are rejected and are never turned into local `CF_HDROP` paths.
+file paste requires the `windows` backend. Remote URI lists are never used as
+local paths directly; a paste request materializes the validated offer into the
+temporary cache and exposes those cache paths through `CF_HDROP`.
 
 No extra ports or firewall rules are needed beyond the ones lan-mouse already
 uses, because the clipboard channel shares the same UDP/TCP port.

@@ -178,14 +178,19 @@ impl ClipboardBackend for WindowsClipboardBackend {
                 if unsafe { PostThreadMessageW(thread_id, WM_APP, WPARAM(0), LPARAM(0)) }.is_err() {
                     break;
                 }
-                match response.await {
-                    Ok(Some(item)) => {
+                // A lost reply must not stop polling forever; the worker may be
+                // busy rendering a virtual file for another consumer.
+                match tokio::time::timeout(Duration::from_secs(5), response).await {
+                    Ok(Ok(Some(item))) => {
                         if tx.send(ClipboardChange::New(item)).await.is_err() {
                             break;
                         }
                     }
-                    Ok(None) => {}
-                    Err(_) => break,
+                    Ok(Ok(None)) => {}
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        log::warn!("windows clipboard: poll timed out; retrying");
+                    }
                 }
             }
         });
@@ -257,6 +262,9 @@ fn worker(
     ole_available: Arc<AtomicBool>,
     max_item_size: usize,
 ) {
+    // CF_HDROP materializes offers under this directory; clear caches left by
+    // a previous daemon run now that no Explorer copy can still be using them.
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("lan-mouse-clipboard"));
     let ole_ok = unsafe { OleInitialize(None) }.is_ok();
     ole_available.store(ole_ok, Ordering::SeqCst);
     let thread_id = unsafe { GetCurrentThreadId() };
@@ -309,6 +317,10 @@ fn worker(
                         if sequence == state.last_observed {
                             let _ = reply.send(None);
                         } else {
+                            log::debug!(
+                                "windows clipboard: observed sequence {sequence} (last {})",
+                                state.last_observed
+                            );
                             let value = match read_current_item(state.max_item_size) {
                                 ReadOutcome::Item(item) => {
                                     state.last_observed = sequence;

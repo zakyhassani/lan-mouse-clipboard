@@ -56,15 +56,19 @@ File sync follows the clipboard enable switch and can be disabled with
 
 On Windows the native clipboard backend supports text, images and file lists.
 Local file copies are read from `CF_HDROP`. Received file offers are exposed as
-OLE virtual files (`CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS`), so Explorer
-and other OLE-aware apps read file bytes lazily from the sender.
+OLE virtual files (`CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS`) and as a
+materialized `CF_HDROP`. OLE-aware apps can read file bytes lazily; Explorer's
+paste requests `CF_HDROP`, which downloads the whole offer into a temporary
+cache before copying.
 
 - Directory trees and empty directories are supported.
 - Windows-invalid names and case-insensitive collisions reject the whole offer;
   names are never silently changed.
 - Remote URI lists are rejected for security; they are never installed as local
-  paths.
-- Apps that only accept `CF_HDROP` cannot paste remote virtual files.
+  paths. Only the validated offer is materialized, under
+  `%TEMP%\lan-mouse-clipboard`.
+- Explorer and other `CF_HDROP`-only apps work; their paste downloads all files
+  first.
 - The daemon must stay running; sender offer retention is limited to the last
   8 offers.
 - Text is preferred over an accompanying bitmap; image-only copies use PNG,
