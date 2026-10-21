@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Simulated tests for the OS clipboard backends.
 //!
 //! `WlClipboardBackend` and `ClipHistBackend` shell out to external tools

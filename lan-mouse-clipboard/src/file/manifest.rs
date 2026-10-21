@@ -5,14 +5,24 @@
 //! from the peer. File names are raw Unix bytes and are always single
 //! components; paths are rebuilt locally from the entry graph.
 
-use std::collections::HashSet;
-use std::fs;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(unix, windows))]
 use percent_encoding::percent_decode_str;
+#[cfg(any(unix, windows))]
+use std::collections::HashSet;
+#[cfg(any(unix, windows))]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(any(unix, windows))]
 use url::Url;
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
 
 use crate::item::ClipboardItem;
 
@@ -21,8 +31,12 @@ pub const MIME_URI_LIST: &str = "text/uri-list";
 /// GNOME's file-copy format: a `copy`/`cut` command line followed by URIs.
 pub const MIME_GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
 
-/// Maximum length of one file name component.
+/// Maximum length of one Unix file name component.
+#[cfg(unix)]
 pub const MAX_NAME_LEN: usize = 255;
+/// Absolute wire limit for one file name in UTF-8 bytes. Windows names are
+/// limited to 255 UTF-16 units, which can exceed 255 UTF-8 bytes.
+pub const MAX_WIRE_NAME_BYTES: usize = 1024;
 /// Sentinel parent id for a top-level entry.
 pub const ROOT_PARENT: u32 = u32::MAX;
 
@@ -112,6 +126,7 @@ pub fn is_file_candidate(item: &ClipboardItem) -> bool {
 }
 
 /// Extract the file paths from an item, preferring `text/uri-list`.
+#[cfg(unix)]
 pub fn item_paths(item: &ClipboardItem) -> Vec<PathBuf> {
     let uri_list = item
         .reps
@@ -135,6 +150,7 @@ pub fn item_paths(item: &ClipboardItem) -> Vec<PathBuf> {
 /// Non-file schemes, remote hosts, comments and blank lines are ignored.
 /// Paths are canonicalized and deduplicated. `gnome` strips the leading
 /// `copy`/`cut` command line used by `x-special/gnome-copied-files`.
+#[cfg(unix)]
 pub fn parse_uri_list(data: &[u8], gnome: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -189,6 +205,7 @@ pub fn parse_uri_list(data: &[u8], gnome: bool) -> Vec<PathBuf> {
 }
 
 /// Parse one `file://` URI into a raw-bytes path.
+#[cfg(unix)]
 fn parse_file_uri(line: &str) -> Option<PathBuf> {
     let url = match Url::parse(line) {
         Ok(url) => url,
@@ -216,6 +233,7 @@ fn parse_file_uri(line: &str) -> Option<PathBuf> {
 }
 
 /// Encode a local path as a `file://` URI with percent escapes.
+#[cfg(unix)]
 pub fn path_to_file_uri(path: &Path) -> String {
     let mut out = String::from("file://");
     for &b in path.as_os_str().as_bytes() {
@@ -234,6 +252,7 @@ pub fn path_to_file_uri(path: &Path) -> String {
 /// while kind, size and mode come from the target. Directory cycles are
 /// detected by `(st_dev, st_ino)`; a cycle-breaking entry is included but not
 /// descended into.
+#[cfg(unix)]
 pub fn build_manifest(
     paths: &[PathBuf],
     limits: ManifestLimits,
@@ -259,6 +278,7 @@ pub fn build_manifest(
     })
 }
 
+#[cfg(unix)]
 struct Walker {
     limits: ManifestLimits,
     entries: Vec<ManifestEntry>,
@@ -267,6 +287,7 @@ struct Walker {
     visited_dirs: HashSet<(u64, u64)>,
 }
 
+#[cfg(unix)]
 impl Walker {
     fn add(&mut self, path: &Path, parent: Option<u32>) -> Result<Option<u32>, ManifestError> {
         let Some(name) = path.file_name() else {
@@ -407,7 +428,7 @@ impl Manifest {
             }
             let name_len = cursor.u16()? as usize;
             let name = cursor.take(name_len)?.to_vec();
-            if !valid_name(&name) {
+            if !valid_wire_name(&name) {
                 return Err(ManifestError::Invalid("invalid entry name".into()));
             }
             let size = cursor.u64()?;
@@ -452,7 +473,7 @@ impl Manifest {
                     entry.id
                 )));
             }
-            if !valid_name(&entry.name) {
+            if !valid_wire_name(&entry.name) {
                 return Err(ManifestError::Invalid(format!(
                     "invalid name on entry {}",
                     entry.id
@@ -509,15 +530,35 @@ impl Manifest {
     }
 }
 
-/// A name is one non-empty component, distinct from `.`/`..`, without NUL or
-/// a path separator, and at most 255 bytes long.
-pub fn valid_name(name: &[u8]) -> bool {
+/// A wire name is one non-empty component, distinct from `.`/`..`, without
+/// NUL or `/`, and at most [`MAX_WIRE_NAME_BYTES`] long.
+pub fn valid_wire_name(name: &[u8]) -> bool {
     !name.is_empty()
-        && name.len() <= MAX_NAME_LEN
+        && name.len() <= MAX_WIRE_NAME_BYTES
         && name != b"."
         && name != b".."
         && !name.contains(&0)
         && !name.contains(&b'/')
+}
+
+/// A Unix name is additionally limited to 255 bytes by NAME_MAX.
+#[cfg(unix)]
+pub fn valid_name(name: &[u8]) -> bool {
+    name.len() <= MAX_NAME_LEN && valid_wire_name(name)
+}
+
+/// Validate names received for a Unix receiver.
+#[cfg(unix)]
+pub fn validate_unix_names(manifest: &Manifest) -> Result<(), ManifestError> {
+    for entry in &manifest.entries {
+        if entry.name.len() > MAX_NAME_LEN {
+            return Err(ManifestError::Invalid(format!(
+                "name on entry {} exceeds the Unix limit",
+                entry.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 struct Cursor<'a> {
@@ -568,7 +609,297 @@ impl<'a> Cursor<'a> {
     }
 }
 
-#[cfg(test)]
+// ---------------------------------------------------------------------------
+// Windows path and walking implementation
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+pub fn item_paths(item: &ClipboardItem) -> Vec<PathBuf> {
+    let uri_list = item
+        .reps
+        .iter()
+        .find(|(mime, _)| base_mime(mime).eq_ignore_ascii_case(MIME_URI_LIST));
+    if let Some((_, data)) = uri_list {
+        return parse_uri_list(data, false);
+    }
+    if let Some((_, data)) = item
+        .reps
+        .iter()
+        .find(|(mime, _)| base_mime(mime).eq_ignore_ascii_case(MIME_GNOME_COPIED_FILES))
+    {
+        return parse_uri_list(data, true);
+    }
+    Vec::new()
+}
+
+#[cfg(windows)]
+pub fn parse_uri_list(data: &[u8], gnome: bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut first_data_line = true;
+
+    for raw in data.split(|b| *b == b'\n') {
+        let line = match std::str::from_utf8(raw) {
+            Ok(line) => line.trim_end_matches('\r').trim(),
+            Err(_) => continue,
+        };
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if gnome && first_data_line {
+            first_data_line = false;
+            let cmd = line.to_ascii_lowercase();
+            if cmd == "copy" || cmd == "cut" {
+                continue;
+            }
+        }
+        first_data_line = false;
+        let Some(path) = parse_file_uri(line) else {
+            continue;
+        };
+        let Ok(canonical) = fs::canonicalize(&path) else {
+            log::warn!("file offer: skipping missing path {}", path.display());
+            continue;
+        };
+        if canonical.parent().is_none() {
+            log::warn!("file offer: skipping a drive root");
+            continue;
+        }
+        match fs::metadata(&canonical) {
+            Ok(meta) if meta.is_file() || meta.is_dir() => {}
+            Ok(_) => {
+                log::warn!("file offer: skipping non-file {}", canonical.display());
+                continue;
+            }
+            Err(e) => {
+                log::warn!(
+                    "file offer: skipping unreadable {}: {e}",
+                    canonical.display()
+                );
+                continue;
+            }
+        }
+        let key = canonical.to_string_lossy().to_lowercase();
+        if seen.insert(key) {
+            out.push(canonical);
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn parse_file_uri(line: &str) -> Option<PathBuf> {
+    let url = match Url::parse(line) {
+        Ok(url) => url,
+        Err(e) => {
+            log::warn!("file offer: invalid URI {line:?}: {e}");
+            return None;
+        }
+    };
+    if url.scheme() != "file" {
+        return None;
+    }
+    let decoded: Vec<u8> = percent_decode_str(url.path()).collect();
+    let path = String::from_utf8(decoded).ok()?;
+    let path = path.replace('/', "\\");
+    let path = match url.host_str() {
+        None => {
+            let stripped = path.strip_prefix('\\').unwrap_or(&path);
+            PathBuf::from(stripped)
+        }
+        Some(host) if host.eq_ignore_ascii_case("localhost") => {
+            let stripped = path.strip_prefix('\\').unwrap_or(&path);
+            PathBuf::from(stripped)
+        }
+        Some(host) if host.len() == 1 && host.chars().all(|c| c.is_ascii_alphabetic()) => {
+            // Some apps emit file://C:/path instead of file:///C:/path.
+            PathBuf::from(format!("{}:{}", host.to_ascii_uppercase(), path))
+        }
+        Some(host) => {
+            // UNC share: file://server/share/path -> \\server\share\path.
+            if host.contains(['\\', '/']) {
+                return None;
+            }
+            PathBuf::from(format!("\\\\{}{}", host, path))
+        }
+    };
+    if !path.is_absolute() || path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(path)
+}
+
+#[cfg(windows)]
+pub fn path_to_file_uri(path: &Path) -> String {
+    let mut normalized = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
+        normalized = format!("//{rest}");
+    } else if let Some(rest) = normalized.strip_prefix("//?/") {
+        normalized = rest.to_string();
+    }
+    let (prefix, rest) = if let Some(rest) = normalized.strip_prefix("//") {
+        ("file://", rest)
+    } else {
+        (
+            "file:///",
+            normalized.strip_prefix('/').unwrap_or(&normalized),
+        )
+    };
+    let mut out = String::from(prefix);
+    for &b in rest.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+pub fn build_manifest(
+    paths: &[PathBuf],
+    limits: ManifestLimits,
+) -> Result<BuiltManifest, ManifestError> {
+    let mut walker = WindowsWalker {
+        limits,
+        entries: Vec::new(),
+        paths: Vec::new(),
+        dir_size: 4,
+        visited_dirs: HashSet::new(),
+    };
+    for path in paths {
+        walker.add(path, None)?;
+    }
+    if walker.entries.is_empty() {
+        return Err(ManifestError::NoFiles);
+    }
+    Ok(BuiltManifest {
+        manifest: Manifest {
+            entries: walker.entries,
+        },
+        paths: walker.paths,
+    })
+}
+
+#[cfg(windows)]
+struct WindowsWalker {
+    limits: ManifestLimits,
+    entries: Vec<ManifestEntry>,
+    paths: Vec<PathBuf>,
+    dir_size: usize,
+    visited_dirs: HashSet<String>,
+}
+
+#[cfg(windows)]
+impl WindowsWalker {
+    fn add(&mut self, path: &Path, parent: Option<u32>) -> Result<Option<u32>, ManifestError> {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            log::warn!(
+                "file offer: skipping a name that is not valid Unicode: {}",
+                path.display()
+            );
+            return Ok(None);
+        };
+        if name.encode_utf16().count() > 255
+            || !valid_wire_name(name.as_bytes())
+            || crate::file::windows::validate_component(name).is_err()
+        {
+            log::warn!("file offer: skipping invalid name in {}", path.display());
+            return Ok(None);
+        }
+        let meta = match fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                log::warn!("file offer: skipping {}: {e}", path.display());
+                return Ok(None);
+            }
+        };
+        if !meta.is_file() && !meta.is_dir() {
+            log::warn!("file offer: skipping non-file {}", path.display());
+            return Ok(None);
+        }
+
+        if self.entries.len() >= self.limits.max_entries {
+            return Err(ManifestError::TooManyEntries(
+                self.entries.len() + 1,
+                self.limits.max_entries,
+            ));
+        }
+        let id = self.entries.len() as u32;
+        let kind = if meta.is_dir() { KIND_DIR } else { KIND_FILE };
+        let name = name.as_bytes().to_vec();
+        let entry_size = entry_encoded_len(&name);
+        self.dir_size = self
+            .dir_size
+            .checked_add(entry_size)
+            .ok_or(ManifestError::TooLarge(usize::MAX, self.limits.max_bytes))?;
+        if self.dir_size > self.limits.max_bytes {
+            return Err(ManifestError::TooLarge(
+                self.dir_size,
+                self.limits.max_bytes,
+            ));
+        }
+        let readonly = meta.file_attributes() & FILE_ATTRIBUTE_READONLY.0 != 0;
+        let mode = match (kind, readonly) {
+            (KIND_DIR, false) => 0o755,
+            (KIND_DIR, true) => 0o555,
+            (_, false) => 0o644,
+            (_, true) => 0o444,
+        };
+        let (mtime_sec, mtime_nsec) = filetime_to_unix(meta.last_write_time());
+        self.entries.push(ManifestEntry {
+            id,
+            parent,
+            kind,
+            name,
+            size: if kind == KIND_FILE {
+                meta.file_size()
+            } else {
+                0
+            },
+            mode,
+            mtime_sec,
+            mtime_nsec,
+        });
+        self.paths.push(path.to_path_buf());
+
+        if kind == KIND_DIR {
+            let key = fs::canonicalize(path)
+                .ok()
+                .map(|path| path.to_string_lossy().to_lowercase());
+            let descend = key
+                .as_ref()
+                .is_some_and(|key| self.visited_dirs.insert(key.clone()));
+            if descend {
+                let read = match fs::read_dir(path) {
+                    Ok(read) => read,
+                    Err(e) => {
+                        log::warn!("file offer: cannot list {}: {e}", path.display());
+                        return Ok(Some(id));
+                    }
+                };
+                let mut children: Vec<PathBuf> = read.flatten().map(|entry| entry.path()).collect();
+                children.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                for child in children {
+                    self.add(&child, Some(id))?;
+                }
+            }
+        }
+        Ok(Some(id))
+    }
+}
+
+#[cfg(windows)]
+fn filetime_to_unix(filetime: u64) -> (i64, u32) {
+    const EPOCH_DIFFERENCE: i128 = 116_444_736_000_000_000;
+    let ticks = filetime as i128 - EPOCH_DIFFERENCE;
+    let seconds = ticks.div_euclid(10_000_000);
+    let remainder = ticks.rem_euclid(10_000_000);
+    (seconds as i64, (remainder * 100) as u32)
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -797,5 +1128,85 @@ mod tests {
         let bytes = built.manifest.encode(limits()).unwrap();
         assert!(bytes.len() >= 4);
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_file(tag: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("lan_mouse_win_{}_{}.txt", tag, std::process::id()));
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(b"windows path").unwrap();
+        path
+    }
+
+    #[test]
+    fn drive_path_uri_roundtrip() {
+        let path = temp_file("drive");
+        let uri = path_to_file_uri(&path);
+        assert!(uri.starts_with("file:///"));
+        assert!(!uri.contains('\\'));
+        let parsed = parse_uri_list(format!("{uri}\r\n").as_bytes(), false);
+        assert_eq!(parsed, vec![fs::canonicalize(&path).unwrap()]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn uri_parser_accepts_drive_and_unc() {
+        assert_eq!(
+            parse_file_uri("file:///C:/Users/A%20B/file.txt"),
+            Some(PathBuf::from(r"C:\Users\A B\file.txt"))
+        );
+        assert_eq!(
+            parse_file_uri("file://C:/Users/file.txt"),
+            Some(PathBuf::from(r"C:\Users\file.txt"))
+        );
+        assert_eq!(
+            parse_file_uri("file://server/share/file.txt"),
+            Some(PathBuf::from(r"\\server\share\file.txt"))
+        );
+        assert_eq!(
+            parse_file_uri("file://localhost/C:/file.txt"),
+            Some(PathBuf::from(r"C:\file.txt"))
+        );
+        assert!(parse_file_uri("file:///relative").is_none());
+        assert!(parse_file_uri("https://example.com/file").is_none());
+    }
+
+    #[test]
+    fn percent_escapes_work_in_windows_paths() {
+        let path = temp_file("space");
+        let parent = path.parent().unwrap().join("lan mouse %#.txt");
+        fs::copy(&path, &parent).unwrap();
+        let uri = path_to_file_uri(&parent);
+        assert!(uri.contains("%20"));
+        assert!(uri.contains("%25"));
+        assert!(uri.contains("%23"));
+        let parsed = parse_uri_list(format!("{uri}\n").as_bytes(), false);
+        assert_eq!(parsed, vec![fs::canonicalize(&parent).unwrap()]);
+        fs::remove_file(parent).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filetime_conversion_handles_epoch_and_seconds() {
+        assert_eq!(filetime_to_unix(116_444_736_000_000_000), (0, 0));
+        assert_eq!(filetime_to_unix(116_444_736_010_000_000), (1, 0));
+        assert_eq!(
+            filetime_to_unix(116_444_736_000_000_000 + 5_000_000),
+            (0, 500_000_000)
+        );
+    }
+
+    #[test]
+    fn wire_name_limit_allows_unicode_but_unix_does_not_apply() {
+        let name = "\u{4e2d}".repeat(100);
+        assert!(name.len() > 255);
+        assert!(name.len() <= MAX_WIRE_NAME_BYTES);
+        assert!(valid_wire_name(name.as_bytes()));
     }
 }

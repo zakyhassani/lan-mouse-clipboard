@@ -1,15 +1,23 @@
-//! Remote file offers: validation, FUSE generations and clipboard updates.
+//! Remote file offers: validation, platform views and lazy markers.
 //!
 //! A new peer ignores [`FileOffer`] frames, so the normal `Announce` still
 //! carries the sender's original URI list. The receiver marks accepted offers
-//! as lazy and suppresses the matching Announce, which prevents the legacy
-//! same-path behavior from overwriting the local FUSE view.
+//! as lazy and suppresses the matching Announce. Linux creates a FUSE
+//! generation; Windows returns a validated virtual-file plan for the OLE
+//! backend.
 
 use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
 use crate::file::fuse::ClipboardMount;
-use crate::file::manifest::{MIME_URI_LIST, Manifest, ManifestLimits, path_to_file_uri};
+#[cfg(target_os = "linux")]
+use crate::file::manifest::{MIME_URI_LIST, path_to_file_uri, validate_unix_names};
+use crate::file::manifest::{Manifest, ManifestLimits};
+#[cfg(windows)]
+use crate::file::windows::VirtualFiles;
+#[cfg(target_os = "linux")]
 use crate::item::ClipboardItem;
 use crate::protocol::{FILE_PROTOCOL_VERSION, FileOffer};
 
@@ -17,7 +25,19 @@ use crate::protocol::{FILE_PROTOCOL_VERSION, FileOffer};
 /// match their Announce.
 const RECENT_OFFERS: usize = 64;
 
+/// The platform-specific result of accepting an offer.
+#[derive(Debug)]
+pub enum AcceptedFile {
+    /// Linux: URIs into the FUSE mount.
+    #[cfg(target_os = "linux")]
+    UriList(ClipboardItem),
+    /// Windows: a validated descriptor tree for OLE virtual files.
+    #[cfg(windows)]
+    VirtualFiles(VirtualFiles),
+}
+
 pub struct Receiver {
+    #[cfg(target_os = "linux")]
     mount: Option<Arc<ClipboardMount>>,
     limits: ManifestLimits,
     recent: VecDeque<([u8; 8], u64)>,
@@ -25,6 +45,7 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    #[cfg(target_os = "linux")]
     pub fn new(mount: Option<Arc<ClipboardMount>>, limits: ManifestLimits) -> Self {
         Self {
             mount,
@@ -34,17 +55,27 @@ impl Receiver {
         }
     }
 
-    /// Validate and apply a `FileOffer`, returning the clipboard item to set.
+    #[cfg(windows)]
+    pub fn new(limits: ManifestLimits) -> Self {
+        Self {
+            limits,
+            recent: VecDeque::new(),
+            lazy: VecDeque::new(),
+        }
+    }
+
+    /// Validate a `FileOffer` and prepare the platform view.
     ///
     /// `self_origin` rejects offers that claim to come from this machine.
-    /// Returns `None` when the offer is invalid, unsupported, or FUSE is not
-    /// mounted; in every such case the following Announce is applied normally.
+    /// Returns `None` for invalid/unsupported offers; on Windows the caller
+    /// should suppress the following Announce even when this returns `None`,
+    /// because the sender's paths are not local.
     pub fn accept(
         &mut self,
         peer_origin: [u8; 8],
         self_origin: [u8; 8],
         offer: &FileOffer,
-    ) -> Option<ClipboardItem> {
+    ) -> Option<AcceptedFile> {
         if offer.version != FILE_PROTOCOL_VERSION {
             log::debug!(
                 "file offer: unsupported version {}; applying Announce",
@@ -64,7 +95,6 @@ impl Receiver {
             log::debug!("file offer: duplicate offer for serial {}", offer.serial);
             return None;
         }
-        let mount = self.mount.as_ref()?;
         let manifest = match Manifest::decode(&offer.manifest, self.limits) {
             Ok(manifest) => manifest,
             Err(e) => {
@@ -72,26 +102,49 @@ impl Receiver {
                 return None;
             }
         };
-        let Some(paths) = mount.add_generation(offer.origin, offer.serial, manifest) else {
-            log::warn!("file offer: could not create a FUSE generation");
-            return None;
-        };
-        if paths.is_empty() {
-            log::warn!("file offer: manifest has no top-level entries");
-            mount.remove_generation(offer.origin, offer.serial);
-            return None;
+
+        #[cfg(target_os = "linux")]
+        {
+            let mount = self.mount.as_ref()?;
+            if let Err(e) = validate_unix_names(&manifest) {
+                log::warn!("file offer: rejected Unix names: {e}");
+                return None;
+            }
+            let Some(paths) = mount.add_generation(offer.origin, offer.serial, manifest) else {
+                log::warn!("file offer: could not create a FUSE generation");
+                return None;
+            };
+            if paths.is_empty() {
+                log::warn!("file offer: manifest has no top-level entries");
+                mount.remove_generation(offer.origin, offer.serial);
+                return None;
+            }
+            let mut data = String::new();
+            for path in &paths {
+                data.push_str(&path_to_file_uri(path));
+                data.push_str("\r\n");
+            }
+            self.remember(offer.origin, offer.serial);
+            Some(AcceptedFile::UriList(ClipboardItem {
+                origin: offer.origin,
+                serial: offer.serial,
+                reps: vec![(MIME_URI_LIST.to_string(), data.into_bytes())],
+            }))
         }
-        let mut data = String::new();
-        for path in &paths {
-            data.push_str(&path_to_file_uri(path));
-            data.push_str("\r\n");
+
+        #[cfg(windows)]
+        {
+            match crate::file::windows::validate_manifest(&manifest) {
+                Ok(files) => {
+                    self.remember(offer.origin, offer.serial);
+                    Some(AcceptedFile::VirtualFiles(files))
+                }
+                Err(e) => {
+                    log::warn!("file offer: rejected for Windows: {e}");
+                    None
+                }
+            }
         }
-        self.remember(offer.origin, offer.serial);
-        Some(ClipboardItem {
-            origin: offer.origin,
-            serial: offer.serial,
-            reps: vec![(MIME_URI_LIST.to_string(), data.into_bytes())],
-        })
     }
 
     /// Mark an applied offer so its Announce is skipped.
@@ -106,6 +159,7 @@ impl Receiver {
     pub fn discard(&mut self, origin: [u8; 8], serial: u64) {
         self.recent.retain(|id| *id != (origin, serial));
         self.lazy.retain(|id| *id != (origin, serial));
+        #[cfg(target_os = "linux")]
         if let Some(mount) = &self.mount {
             mount.remove_generation(origin, serial);
         }
@@ -122,12 +176,21 @@ impl Receiver {
 
     /// Whether a local path lies inside the lazy view.
     pub fn contains_path(&self, path: &std::path::Path) -> bool {
-        self.mount
-            .as_ref()
-            .is_some_and(|mount| mount.contains_path(path))
+        #[cfg(target_os = "linux")]
+        {
+            self.mount
+                .as_ref()
+                .is_some_and(|mount| mount.contains_path(path))
+        }
+        #[cfg(windows)]
+        {
+            let _ = path;
+            false
+        }
     }
 
     pub fn gc(&self) {
+        #[cfg(target_os = "linux")]
         if let Some(mount) = &self.mount {
             mount.gc();
         }
@@ -145,7 +208,7 @@ fn trim<T>(queue: &mut VecDeque<T>, max: usize) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

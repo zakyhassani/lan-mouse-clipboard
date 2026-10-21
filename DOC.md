@@ -98,3 +98,15 @@ On Linux it also supports lazy file and directory copies:
 File offers are tracked by `(origin, serial)`, not by the existing content-hash
 loop prevention. The receiver also suppresses the local watcher echo of the URI
 list it just set and ignores changes that point back into its own mount.
+
+### Windows
+
+The Windows backend owns one clipboard worker thread with an OLE STA message
+loop. Local text, images and `CF_HDROP` file lists are polled through the Win32
+clipboard. A received file offer becomes an `IDataObject` with
+`CFSTR_FILEDESCRIPTORW`/`CFSTR_FILECONTENTS`; each file is a lazy `IStream` that
+requests 1 MiB chunks through the broker. Directory trees use relative
+`cFileName` paths and empty directories use directory descriptors. Names that
+Windows cannot represent reject the whole offer. Remote URI lists are rejected
+rather than converted into local paths; apps that only accept `CF_HDROP` do not
+support remote virtual files.

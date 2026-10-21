@@ -52,6 +52,27 @@ File sync follows the clipboard enable switch and can be disabled with
 `clipboard.file_sync = false` in `config.toml`. See
 [CLIPBOARD.md](./CLIPBOARD.md#lazy-file-and-directory-sync) for details.
 
+## Clipboard file sync (Windows)
+
+On Windows the native clipboard backend supports text, images and file lists.
+Local file copies are read from `CF_HDROP`. Received file offers are exposed as
+OLE virtual files (`CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS`), so Explorer
+and other OLE-aware apps read file bytes lazily from the sender.
+
+- Directory trees and empty directories are supported.
+- Windows-invalid names and case-insensitive collisions reject the whole offer;
+  names are never silently changed.
+- Remote URI lists are rejected for security; they are never installed as local
+  paths.
+- Apps that only accept `CF_HDROP` cannot paste remote virtual files.
+- The daemon must stay running; sender offer retention is limited to the last
+  8 offers.
+- Text is preferred over an accompanying bitmap; image-only copies use PNG,
+  CF_DIBV5 and CF_DIB.
+
+Use `backend = "auto"` (Windows is selected first) or `backend = "windows"` in
+`config.toml`. See [CLIPBOARD.md](./CLIPBOARD.md#windows-file-and-directory-sync).
+
 ## Encryption
 
 Lan Mouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).

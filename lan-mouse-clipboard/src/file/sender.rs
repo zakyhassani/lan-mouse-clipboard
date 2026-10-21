@@ -6,7 +6,10 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as WindowsFileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -236,7 +239,10 @@ fn read_at(path: &PathBuf, offset: u64, length: usize) -> std::io::Result<Vec<u8
     let mut data = vec![0u8; length];
     let mut done = 0usize;
     while done < length {
+        #[cfg(unix)]
         let n = file.read_at(&mut data[done..], offset + done as u64)?;
+        #[cfg(windows)]
+        let n = file.seek_read(&mut data[done..], offset + done as u64)?;
         if n == 0 {
             break;
         }
