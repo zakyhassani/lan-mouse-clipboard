@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Simulated tests for the DBus (`klipper`) clipboard backend.
 //!
 //! Compiled only when the `dbus`/`klipper` feature is enabled. `dbus-send` is

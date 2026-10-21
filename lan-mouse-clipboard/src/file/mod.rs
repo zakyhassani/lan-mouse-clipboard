@@ -6,10 +6,13 @@
 //! chunks when an application actually reads a file.
 
 pub mod broker;
+#[cfg(target_os = "linux")]
 pub mod fuse;
 pub mod manifest;
 pub mod receiver;
 pub mod sender;
+#[cfg(windows)]
+pub mod windows;
 
 use std::sync::Arc;
 
@@ -17,6 +20,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::FileOptions;
 use crate::file::broker::Broker;
+#[cfg(target_os = "linux")]
 use crate::file::fuse::ClipboardMount;
 use crate::file::manifest::{MAX_MANIFEST_BYTES, MAX_MANIFEST_ENTRIES, ManifestLimits};
 use crate::file::receiver::Receiver;
@@ -28,7 +32,10 @@ pub struct FileService {
     pub broker: Arc<Broker>,
     pub receiver: Receiver,
     pub worker: ManifestWorker,
+    #[cfg(target_os = "linux")]
     pub mount: Option<Arc<ClipboardMount>>,
+    /// Runtime handle used by Windows OLE streams.
+    pub runtime: tokio::runtime::Handle,
     /// Bounds driver-spawned read tasks: eight active plus eight queued.
     pub read_slots: Arc<Semaphore>,
 }
@@ -53,7 +60,9 @@ impl FileService {
                 .clamp(1024 * 1024, MAX_MANIFEST_BYTES),
         };
         let broker = Arc::new(Broker::new(directed_tx));
-        let mount = ClipboardMount::start(broker.clone(), runtime);
+        #[cfg(target_os = "linux")]
+        let mount = ClipboardMount::start(broker.clone(), runtime.clone());
+        #[cfg(target_os = "linux")]
         if mount.is_none() {
             log::warn!(
                 "file sync: FUSE view unavailable; receiving files lazily is disabled \
@@ -65,9 +74,20 @@ impl FileService {
             Self {
                 offers: Arc::new(OfferStore::new()),
                 broker,
-                receiver: Receiver::new(mount.clone(), limits),
+                receiver: {
+                    #[cfg(target_os = "linux")]
+                    {
+                        Receiver::new(mount.clone(), limits)
+                    }
+                    #[cfg(windows)]
+                    {
+                        Receiver::new(limits)
+                    }
+                },
                 worker,
+                #[cfg(target_os = "linux")]
                 mount,
+                runtime,
                 read_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_READS * 2)),
             },
             build_rx,

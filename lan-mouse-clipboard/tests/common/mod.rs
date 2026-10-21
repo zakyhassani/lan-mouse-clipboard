@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Shared helpers for tests that simulate external clipboard tools
 //! (`wl-paste`, `wl-copy`, `cliphist`, `dbus-send`) with stub executables.
 //!

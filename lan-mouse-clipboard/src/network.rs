@@ -194,6 +194,7 @@ pub async fn run_clipboard_server(
     loop {
         tokio::select! {
             _ = health.tick() => {
+                let started = Instant::now();
                 let now = Instant::now();
                 let ping = Message::Ping.encode(0).unwrap_or_else(|_| vec![KIND_PING]);
                 let mut dead = Vec::new();
@@ -219,6 +220,9 @@ pub async fn run_clipboard_server(
                     // Backstop: retrain the IPs, then burst reconnect.
                     let _ = event_tx.try_send(NetworkEvent::Retrain);
                     dial.spawn(&client_config, &conn_tx);
+                }
+                if started.elapsed() >= HEALTH_INTERVAL {
+                    refresh_liveness(&registry, &mut last_seen);
                 }
             }
             _ = retry.tick() => {
@@ -305,14 +309,23 @@ pub async fn run_clipboard_server(
             }
             health_ev = health_rx.recv() => match health_ev {
                 Some(HealthEvent::Pong(addr)) => {
-                    last_seen.insert(addr, Instant::now());
+                    // A late pong may arrive just after the channel was
+                    // dropped; do not let it refresh a dead or reused entry.
+                    if registry.contains(&addr) {
+                        last_seen.insert(addr, Instant::now());
+                    }
                 }
                 Some(HealthEvent::Ping(addr)) => {
+                    let started = Instant::now();
                     let pong = Message::Pong.encode(0).unwrap_or_else(|_| vec![KIND_PONG]);
-                    if !registry.write_to(&addr, &pong).await {
+                    let written = registry.write_to(&addr, &pong).await;
+                    if !written {
                         // Keep the bookkeeping consistent with the registry,
                         // which `write_to` just pruned on the failed write.
                         dial.forget(&mut registry, &mut last_seen, &addr);
+                    }
+                    if started.elapsed() >= HEALTH_INTERVAL {
+                        refresh_liveness(&registry, &mut last_seen);
                     }
                 }
                 None => {}
@@ -328,18 +341,24 @@ pub async fn run_clipboard_server(
             }
             maybe_frame = broadcast_rx.recv() => match maybe_frame {
                 Some(frame) => {
+                    let started = Instant::now();
                     let (_delivered, removed) = registry.broadcast(&frame).await;
                     let evicted = registry.evict_idle();
                     for addr in removed.into_iter().chain(evicted) {
                         dial.forget(&mut registry, &mut last_seen, &addr);
+                    }
+                    if started.elapsed() >= HEALTH_INTERVAL {
+                        refresh_liveness(&registry, &mut last_seen);
                     }
                 }
                 None => break,
             },
             directed = directed_rx.recv() => match directed {
                 Some((origin, frame)) => {
+                    let started = Instant::now();
                     let addr = registry.addr_for_origin(origin);
-                    if !registry.write_to_origin(origin, &frame).await {
+                    let written = registry.write_to_origin(origin, &frame).await;
+                    if !written {
                         log::debug!(
                             "clipboard directed frame for unavailable peer {:02x?}",
                             origin
@@ -348,6 +367,9 @@ pub async fn run_clipboard_server(
                             dial.forget(&mut registry, &mut last_seen, &addr);
                             dial.advance(addr);
                         }
+                    }
+                    if started.elapsed() >= HEALTH_INTERVAL {
+                        refresh_liveness(&registry, &mut last_seen);
                     }
                 }
                 None => break,
@@ -386,6 +408,15 @@ pub async fn run_clipboard_server(
 
 /// Start the per-channel read loop, which feeds inbound frames, disconnect
 /// notifications, and health frames back to the server loop.
+/// A slow or timed-out write stalls the whole network loop, so the wall-clock
+/// gap must not be charged against other peers' pong deadlines.
+fn refresh_liveness(registry: &ConnectionRegistry, last_seen: &mut HashMap<SocketAddr, Instant>) {
+    let now = Instant::now();
+    for addr in registry.peers() {
+        last_seen.insert(addr, now);
+    }
+}
+
 fn normalize_fingerprint(fingerprint: &str) -> String {
     fingerprint
         .chars()
@@ -471,6 +502,17 @@ impl DialState {
         self.peers.iter().any(|p| !self.has_live(p))
     }
 
+    /// The endpoint a peer should dial. A `current` entry that is no longer
+    /// part of the peer's endpoint set (for example after an IP retrain pruned
+    /// the old channel) must not strand the peer on the old address.
+    fn endpoint_for(&self, peer: &PeerEndpoints) -> SocketAddr {
+        self.current
+            .get(&peer.id)
+            .copied()
+            .filter(|addr| peer.all().contains(addr))
+            .unwrap_or(peer.active)
+    }
+
     /// Spawn a connect task for every peer without a live or in-flight
     /// endpoint. Dials never block the accept loop (which would deadlock two
     /// peers dialing each other), and `dialing` guards against duplicate
@@ -481,7 +523,7 @@ impl DialState {
             if self.has_live(peer) || peer.all().iter().any(|a| self.dialing.contains(a)) {
                 continue;
             }
-            let addr = self.current.get(&peer.id).copied().unwrap_or(peer.active);
+            let addr = self.endpoint_for(peer);
             to_dial.push((peer.id.clone(), addr));
         }
         for (id, addr) in to_dial {
@@ -814,6 +856,54 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_current_endpoint_does_not_strand_a_retrain() {
+        let origin = origin_from_fingerprint("peer");
+        let old = SocketAddr::from(([10, 0, 0, 1], 4242));
+        let new = SocketAddr::from(([10, 0, 0, 2], 4242));
+        let old_peer = PeerEndpoints {
+            id: "peer".into(),
+            origin,
+            active: old,
+            fallbacks: Vec::new(),
+        };
+        let mut dial = DialState::new(vec![old_peer.clone()]);
+        assert_eq!(dial.endpoint_for(&old_peer), old);
+
+        // Simulate the live old channel and a retrain that moves the peer to
+        // a new active address. `set_peers` keeps `current` while the channel
+        // is live, then prune removes that channel.
+        let (sink, _reader) = tokio::io::duplex(64);
+        let mut registry = ConnectionRegistry::new(Duration::from_secs(60));
+        registry.insert(old, origin, Box::new(sink), ConnKind::Outgoing);
+        dial.note_live(old, origin);
+        let mut last_seen = HashMap::new();
+        last_seen.insert(old, Instant::now());
+
+        let new_peer = PeerEndpoints {
+            id: "peer".into(),
+            origin,
+            active: new,
+            fallbacks: Vec::new(),
+        };
+        dial.set_peers(vec![new_peer.clone()]);
+        dial.prune(&mut registry, &mut last_seen);
+        assert!(!registry.contains(&old));
+        assert!(dial.any_missing());
+        assert_eq!(dial.endpoint_for(&new_peer), new);
+
+        // A still-valid fallback current entry is retained.
+        let fallback_peer = PeerEndpoints {
+            id: "peer".into(),
+            origin,
+            active: new,
+            fallbacks: vec![old],
+        };
+        dial.peers = vec![fallback_peer.clone()];
+        dial.current.insert("peer".into(), old);
+        assert_eq!(dial.endpoint_for(&fallback_peer), old);
     }
 
     #[test]

@@ -22,6 +22,9 @@ pub mod cliphist;
 #[cfg(any(feature = "klipper", feature = "dbus"))]
 pub mod dbus_klipper;
 
+#[cfg(windows)]
+pub mod windows;
+
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     #[error("backend `{0}` is not available on this system: {1}")]
@@ -49,6 +52,18 @@ pub trait ClipboardBackend: Send + Sync {
     /// A stream of local clipboard changes. Only sources produce events;
     /// pure sinks return an empty/fused stream.
     async fn watch(&self) -> Pin<Box<dyn Stream<Item = ClipboardChange> + Send>>;
+
+    /// Install a received file offer as Windows OLE virtual files.
+    ///
+    /// The default implementation handles nothing; only the Windows backend
+    /// overrides it.
+    #[cfg(windows)]
+    async fn set_file_offer(
+        &self,
+        _files: &std::sync::Arc<crate::file::windows::RemoteFileSet>,
+    ) -> Result<bool, BackendError> {
+        Ok(false)
+    }
 }
 
 /// Which backend to use for the primary source.
@@ -65,6 +80,9 @@ pub enum BackendKind {
     Klipper,
     #[cfg(feature = "dbus")]
     Dbus,
+    /// Native Windows clipboard backend.
+    #[cfg(windows)]
+    Windows,
     /// In-memory backend, used for testing and as a safe fallback.
     Dummy,
 }
@@ -97,6 +115,8 @@ impl BackendKind {
             BackendKind::Klipper => "klipper",
             #[cfg(feature = "dbus")]
             BackendKind::Dbus => "dbus",
+            #[cfg(windows)]
+            BackendKind::Windows => "windows",
             BackendKind::Dummy => "dummy",
         }
     }
@@ -115,6 +135,8 @@ impl BackendKind {
             BackendKind::Klipper => which("dbus-send"),
             #[cfg(feature = "dbus")]
             BackendKind::Dbus => which("dbus-send"),
+            #[cfg(windows)]
+            BackendKind::Windows => true,
             BackendKind::Dummy => true,
         }
     }
@@ -123,6 +145,8 @@ impl BackendKind {
     #[allow(clippy::vec_init_then_push)]
     pub fn candidates() -> Vec<BackendKind> {
         let mut out = Vec::new();
+        #[cfg(windows)]
+        out.push(BackendKind::Windows);
         #[cfg(feature = "wl-clipboard")]
         out.push(BackendKind::WlClipboard);
         #[cfg(feature = "klipper")]
@@ -198,6 +222,10 @@ fn push_primary(
         BackendKind::Klipper => push_dbus(out, "klipper", wayland_active, max_item_size),
         #[cfg(feature = "dbus")]
         BackendKind::Dbus => push_dbus(out, "dbus", wayland_active, max_item_size),
+        #[cfg(windows)]
+        BackendKind::Windows => out.push(Box::new(windows::WindowsClipboardBackend::new(
+            max_item_size,
+        ))),
     }
 }
 
@@ -332,7 +360,7 @@ pub(crate) fn parse_dbus_string(output: &str) -> Option<String> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

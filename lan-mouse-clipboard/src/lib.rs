@@ -8,7 +8,7 @@
 
 pub mod backend;
 pub mod dedup;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod file;
 pub mod item;
 pub mod network;
@@ -100,11 +100,11 @@ struct ClipboardInner {
     backends: Vec<Box<dyn ClipboardBackend>>,
     loop_prevention: LoopPrevention,
     watcher: Option<Pin<Box<dyn Stream<Item = ClipboardChange> + Send>>>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     file_options: FileOptions,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     direct_tx: mpsc::Sender<([u8; 8], Vec<u8>)>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     files: Option<file::FileService>,
 }
 
@@ -132,7 +132,8 @@ impl Clipboard {
             watcher: None,
             file_options: options.files,
             direct_tx: directed_tx,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "linux", windows))]
             files: None,
         };
         let task = tokio::spawn(run_clipboard(
@@ -172,13 +173,13 @@ async fn run_clipboard(
     mut inbound_rx: mpsc::Receiver<InboundFrame>,
     broadcast_tx: mpsc::Sender<Vec<u8>>,
 ) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     let mut build_rx = if inner.enabled {
         start_files(&mut inner)
     } else {
         None
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     let mut build_rx: Option<mpsc::Receiver<PreparedItem>> = None;
 
     if inner.enabled {
@@ -197,7 +198,7 @@ async fn run_clipboard(
                         ClipboardEvent::Disabled
                     }).await;
                     if enabled {
-                        #[cfg(target_os = "linux")]
+                        #[cfg(any(target_os = "linux", windows))]
                         if build_rx.is_none() {
                             build_rx = start_files(&mut inner);
                         }
@@ -239,14 +240,15 @@ async fn run_clipboard(
     }
 }
 
-/// A manifest build result. Only Linux builds the lazy file view.
-#[cfg(target_os = "linux")]
+/// A manifest build result. Linux and Windows build the lazy file view.
+#[cfg(any(target_os = "linux", windows))]
 use crate::file::sender::PreparedItem;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
+#[allow(dead_code)]
 struct PreparedItem;
 
 /// Start the file subsystem on first enable, if it is configured.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn start_files(inner: &mut ClipboardInner) -> Option<mpsc::Receiver<PreparedItem>> {
     if inner.files.is_some() || !inner.file_options.enabled {
         return None;
@@ -314,7 +316,7 @@ async fn handle_local_change(
         return true;
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if let Some(files) = &inner.files {
         if file::manifest::is_file_candidate(&item) {
             if files.worker.submit(item.clone()).await {
@@ -335,7 +337,7 @@ async fn handle_prepared(
     prepared: PreparedItem,
     broadcast_tx: &mpsc::Sender<Vec<u8>>,
 ) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         let file::sender::PreparedItem { item, offer } = prepared;
         if !inner.enabled {
@@ -367,7 +369,7 @@ async fn handle_prepared(
         }
         broadcast_announce(inner.max_item_size, item, broadcast_tx).await
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (inner, prepared, broadcast_tx);
         true
@@ -383,7 +385,7 @@ async fn handle_inbound(
     let peer_origin = frame.origin;
     match Message::decode(&frame.payload) {
         Ok(Message::Announce(item)) => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             if let Some(files) = &mut inner.files {
                 if files.receiver.take_lazy(item.origin, item.serial) {
                     log::debug!(
@@ -398,19 +400,19 @@ async fn handle_inbound(
         Ok(Message::FileOffer(offer)) => handle_file_offer(inner, peer_origin, &offer).await,
         Ok(Message::FileRead(read)) => handle_file_read(inner, peer_origin, read).await,
         Ok(Message::FileData(data)) => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             if let Some(files) = &inner.files {
                 files.broker.complete(peer_origin, data);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", windows)))]
             let _ = data;
         }
         Ok(Message::FileError(error)) => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             if let Some(files) = &inner.files {
                 files.broker.fail(peer_origin, error);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", windows)))]
             let _ = error;
         }
         Ok(Message::Ping | Message::Pong) => {}
@@ -423,60 +425,118 @@ async fn handle_file_offer(
     peer_origin: [u8; 8],
     offer: &protocol::FileOffer,
 ) {
-    #[cfg(target_os = "linux")]
+    if !inner.enabled {
+        return;
+    }
+    #[cfg(any(target_os = "linux", windows))]
     {
-        if !inner.enabled {
-            return;
-        }
         let self_origin = inner.origin;
-        let Some(uri_item) = inner
+        let accepted = inner
             .files
             .as_mut()
-            .and_then(|files| files.receiver.accept(peer_origin, self_origin, offer))
-        else {
-            return;
-        };
-        // The URI list is generated locally, so it does not pass through the
-        // backend's normal item-size accumulation. Enforce the same cap here.
-        if uri_item.total_size() > inner.max_item_size {
-            log::warn!(
-                "file sync: generated URI list is {} bytes, over the {} byte cap",
-                uri_item.total_size(),
-                inner.max_item_size
-            );
-            if let Some(files) = inner.files.as_mut() {
+            .and_then(|files| files.receiver.accept(peer_origin, self_origin, offer));
+
+        #[cfg(target_os = "linux")]
+        {
+            let Some(crate::file::receiver::AcceptedFile::UriList(uri_item)) = accepted else {
+                return;
+            };
+            // The URI list is generated locally, so it does not pass through the
+            // backend's normal item-size accumulation. Enforce the same cap here.
+            if uri_item.total_size() > inner.max_item_size {
+                log::warn!(
+                    "file sync: generated URI list is {} bytes, over the {} byte cap",
+                    uri_item.total_size(),
+                    inner.max_item_size
+                );
+                if let Some(files) = inner.files.as_mut() {
+                    files.receiver.discard(peer_origin, offer.serial);
+                }
+                return;
+            }
+            // The primary backend must accept the URI list; history sinks are
+            // best effort and do not make a failed file set a success.
+            let mut primary_ok = false;
+            for (index, backend) in inner.backends.iter().enumerate() {
+                match backend.set(&uri_item).await {
+                    Ok(()) if index == 0 => primary_ok = true,
+                    Ok(()) => {}
+                    Err(e) => log::warn!("{} set failed: {e}", backend.name()),
+                }
+            }
+            let Some(files) = inner.files.as_mut() else {
+                return;
+            };
+            if primary_ok {
+                // Suppress the local watcher's echo of this exact URI list.
+                inner.loop_prevention.note_sent(&uri_item);
+                files.receiver.mark_lazy(peer_origin, offer.serial);
+                files.receiver.gc();
+                log::info!(
+                    "file sync: accepted lazy offer serial {} from {:02x?}",
+                    offer.serial,
+                    peer_origin
+                );
+            } else {
                 files.receiver.discard(peer_origin, offer.serial);
             }
-            return;
         }
-        // The primary backend must accept the URI list; history sinks are
-        // best effort and do not make a failed file set a success.
-        let mut primary_ok = false;
-        for (index, backend) in inner.backends.iter().enumerate() {
-            match backend.set(&uri_item).await {
-                Ok(()) if index == 0 => primary_ok = true,
-                Ok(()) => {}
-                Err(e) => log::warn!("{} set failed: {e}", backend.name()),
+
+        #[cfg(windows)]
+        {
+            let Some(files) = inner.files.as_ref() else {
+                return;
+            };
+            let Some(crate::file::receiver::AcceptedFile::VirtualFiles(virtual_files)) = accepted
+            else {
+                // A recognized offer that cannot be represented on Windows must
+                // still suppress its Announce: the sender's paths are not local.
+                if offer.origin == peer_origin && offer.origin != self_origin {
+                    if let Some(files) = inner.files.as_mut() {
+                        files.receiver.mark_lazy(peer_origin, offer.serial);
+                    }
+                }
+                return;
+            };
+            let set = std::sync::Arc::new(crate::file::windows::RemoteFileSet {
+                origin: offer.origin,
+                serial: offer.serial,
+                manifest: virtual_files.manifest,
+                entries: virtual_files.entries,
+                broker: files.broker.clone(),
+                runtime: files.runtime.clone(),
+            });
+            let installed = match inner.backends.first() {
+                Some(backend) => match backend.set_file_offer(&set).await {
+                    Ok(installed) => installed,
+                    Err(e) => {
+                        log::warn!("{} file offer set failed: {e}", backend.name());
+                        false
+                    }
+                },
+                None => false,
+            };
+            if let Some(files) = inner.files.as_mut() {
+                files.receiver.mark_lazy(peer_origin, offer.serial);
+                files.receiver.gc();
+            }
+            if installed {
+                log::info!(
+                    "file sync: accepted virtual offer serial {} from {:02x?} ({} entries)",
+                    offer.serial,
+                    peer_origin,
+                    set.entries.len()
+                );
+            } else {
+                log::warn!(
+                    "file sync: could not install virtual offer serial {}; Announce suppressed",
+                    offer.serial
+                );
             }
         }
-        let Some(files) = inner.files.as_mut() else {
-            return;
-        };
-        if primary_ok {
-            // Suppress the local watcher's echo of this exact URI list.
-            inner.loop_prevention.note_sent(&uri_item);
-            files.receiver.mark_lazy(peer_origin, offer.serial);
-            files.receiver.gc();
-            log::info!(
-                "file sync: accepted lazy offer serial {} from {:02x?}",
-                offer.serial,
-                peer_origin
-            );
-        } else {
-            files.receiver.discard(peer_origin, offer.serial);
-        }
     }
-    #[cfg(not(target_os = "linux"))]
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (inner, peer_origin, offer);
     }
@@ -487,7 +547,7 @@ async fn handle_file_read(
     peer_origin: [u8; 8],
     read: protocol::FileRead,
 ) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if let Some(files) = &inner.files {
         let store = files.offers.clone();
         let tx = inner.direct_tx.clone();
@@ -518,7 +578,7 @@ async fn handle_file_read(
             }
         });
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (inner, peer_origin, read);
     }

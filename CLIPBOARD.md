@@ -387,6 +387,35 @@ sequenceDiagram
   tracked by `(origin, serial)` in the receiver. The legacy `Announce` still
   uses the existing rep-hash history.
 
+### Windows file and directory sync
+
+Windows uses native OLE virtual files instead of FUSE:
+
+- A local file copy is read from `CF_HDROP`, converted to a `text/uri-list`
+  item, and offered through the normal `FileOffer`/`Announce` flow.
+- A received `FileOffer` is validated for Windows names and installed as an
+  `IDataObject` with `CFSTR_FILEDESCRIPTORW` and `CFSTR_FILECONTENTS`.
+  Directory trees are represented by relative paths in `cFileName`; empty
+  directories use `FILE_ATTRIBUTE_DIRECTORY` descriptors.
+- Each file is a lazy `IStream`; a read fetches 1 MiB chunks from the sender.
+  Nothing is downloaded at copy time.
+- Names are rejected rather than renamed if they contain Windows-invalid
+  characters, reserved device names, a trailing dot or space, a relative path
+  over 259 UTF-16 units, or case-insensitive sibling collisions. Non-UTF8
+  Linux names are rejected. The whole offer is rejected; no partial tree is
+  pasted.
+- Remote `text/uri-list` items are rejected on Windows. A peer cannot make the
+  receiver place an arbitrary local path on its clipboard.
+- The OLE data object lives in the daemon. If the daemon exits, old virtual
+  clipboard items can no longer be pasted. The sender keeps only its last 8
+  offers; evicting them breaks outstanding paste streams.
+- Apps that only accept `CF_HDROP` will not paste remote virtual files; OLE-aware
+  apps (Explorer, Word, many editors) do. This is the main Windows compatibility
+  limitation.
+- Text is preferred over an accompanying bitmap; image-only copies use PNG,
+  CF_DIBV5 and CF_DIB. Images are decoded with limits to avoid decompression
+  bombs. ACLs, ADS, hidden/system attributes and hardlinks are not preserved.
+
 ## Loop prevention
 
 Because setting a remote item on the local clipboard makes the local backend
@@ -564,12 +593,14 @@ Backends are selected through `BackendKind`:
 | `cliphist`   | sink only   | Pipes received items into `cliphist store` to record history; never a change source. Stores the primary representation's MIME. |
 | `klipper`    | source+sink | KDE clipboard via DBus (`dbus-send`). Text only; rich items are skipped. |
 | `dbus`       | source+sink | Generic DBus clipboard integration. Text only.              |
+| `windows`    | source+sink | Native Win32 clipboard on Windows: CF_UNICODETEXT, CF_DIB/CF_DIBV5/PNG images, and CF_HDROP file lists. Received file offers become OLE virtual files. |
 | `dummy`      | fallback    | In-memory backend used for testing and as a safe fallback.    |
 
 Resolution (`build_backends`):
 
-- With `auto`, candidates are tried in priority order (`wl-clipboard` ->
-  `klipper` -> `dbus` -> `dummy`), skipping ones whose tools are not on `PATH`.
+- With `auto`, candidates are tried in priority order. On Windows, `windows`
+  comes first. Elsewhere the order is `wl-clipboard` -> `klipper` -> `dbus` ->
+  `dummy`, skipping ones whose tools are not on `PATH`.
 - **Single integration rule**: only one clipboard manager may run at a time.
   If a Wayland or Noctalia clipboard manager is already running (detected by
   scanning `/proc` for names like `wl-paste`, `wl-copy`, `cliphist`, `copyq`,
@@ -609,12 +640,12 @@ Clipboard sync is configured in `config.toml` under a `clipboard` table:
 [clipboard]
 # enable clipboard sync
 enabled = true
-# backend: "auto" | "wl-clipboard" | "cliphist" | "klipper" | "dbus"
+# backend: "auto" | "windows" | "wl-clipboard" | "cliphist" | "klipper" | "dbus"
 backend = "auto"
 # total size cap for a single item (all representations combined), in bytes
 # default 64 MiB; clamped to [1 KiB, 256 MiB]
 max_item_size = 67108864
-# lazy file/directory sync (Linux); defaults to true when clipboard sync is on
+# lazy file/directory sync (Linux and Windows); defaults to true when clipboard sync is on
 file_sync = true
 # maximum manifest entries per file offer; clamped to [1, 1000000]
 file_manifest_max_entries = 100000
@@ -633,9 +664,10 @@ accepts. There is no negotiation, so **set the same value on every host**;
 a peer configured larger can send items a smaller peer rejects. The clamped
 range is `[1 KiB, 256 MiB]`.
 
-`file_sync` follows the clipboard enable switch. When it is disabled (or FUSE
-is unavailable), only the ordinary `text/uri-list` `Announce` is used, which
-keeps the previous same-path behavior on the receiving host.
+`file_sync` follows the clipboard enable switch. On Linux, disabling it (or
+missing FUSE) leaves only the ordinary `text/uri-list` `Announce`. On Windows,
+file paste requires the `windows` backend and OLE virtual files; remote URI
+lists are rejected and are never turned into local `CF_HDROP` paths.
 
 No extra ports or firewall rules are needed beyond the ones lan-mouse already
 uses, because the clipboard channel shares the same UDP/TCP port.

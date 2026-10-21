@@ -13,6 +13,11 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub type PeerSink = Box<dyn AsyncWrite + Send + Unpin>;
 
+/// Bound a single socket write. A peer that cannot accept a frame within this
+/// window is treated as dead and removed, so the network loop cannot stall
+/// forever on a partitioned connection.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnKind {
     /// A connection we established to a peer (subject to idle eviction).
@@ -31,14 +36,18 @@ struct Entry {
 
 /// Write `frame` to one entry, stamping it as used on success. Logs and
 /// returns `false` on failure; the caller removes the entry.
-async fn write_entry(addr: SocketAddr, entry: &mut Entry, frame: &[u8]) -> bool {
-    match entry.sink.write_all(frame).await {
-        Ok(()) => {
+async fn write_entry(addr: SocketAddr, entry: &mut Entry, frame: &[u8], timeout: Duration) -> bool {
+    match tokio::time::timeout(timeout, entry.sink.write_all(frame)).await {
+        Ok(Ok(())) => {
             entry.last_used = Instant::now();
             true
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::warn!("clipboard send to {addr} failed: {e}");
+            false
+        }
+        Err(_) => {
+            log::warn!("clipboard send to {addr} timed out; dropping peer");
             false
         }
     }
@@ -48,13 +57,20 @@ async fn write_entry(addr: SocketAddr, entry: &mut Entry, frame: &[u8]) -> bool 
 pub struct ConnectionRegistry {
     peers: HashMap<SocketAddr, Entry>,
     idle_timeout: Duration,
+    write_timeout: Duration,
 }
 
 impl ConnectionRegistry {
     pub fn new(idle_timeout: Duration) -> Self {
+        Self::with_write_timeout(idle_timeout, WRITE_TIMEOUT)
+    }
+
+    /// Construct with an explicit write timeout. Tests use a short value.
+    pub fn with_write_timeout(idle_timeout: Duration, write_timeout: Duration) -> Self {
         Self {
             peers: HashMap::new(),
             idle_timeout,
+            write_timeout,
         }
     }
 
@@ -115,7 +131,7 @@ impl ConnectionRegistry {
         let Some(entry) = self.peers.get_mut(addr) else {
             return false;
         };
-        if write_entry(*addr, entry, frame).await {
+        if write_entry(*addr, entry, frame, self.write_timeout).await {
             return true;
         }
         self.peers.remove(addr);
@@ -131,7 +147,7 @@ impl ConnectionRegistry {
             return false;
         };
         let addr = *addr;
-        if write_entry(addr, entry, frame).await {
+        if write_entry(addr, entry, frame, self.write_timeout).await {
             return true;
         }
         self.peers.remove(&addr);
@@ -147,7 +163,7 @@ impl ConnectionRegistry {
         let mut to_remove = Vec::new();
         let mut delivered = 0;
         for (addr, entry) in self.peers.iter_mut() {
-            if write_entry(*addr, entry, frame).await {
+            if write_entry(*addr, entry, frame, self.write_timeout).await {
                 delivered += 1;
             } else {
                 to_remove.push(*addr);
@@ -209,6 +225,21 @@ mod tests {
             f.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"hello");
         }
+    }
+
+    #[tokio::test]
+    async fn timed_out_write_removes_peer() {
+        let (a, _b) = tokio::io::duplex(1);
+        let mut reg = ConnectionRegistry::with_write_timeout(
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        );
+        let addr = SocketAddr::from(([10, 0, 0, 8], 8000));
+        reg.insert(addr, [8; 8], Box::new(a), ConnKind::Incoming);
+        let (delivered, removed) = reg.broadcast(&vec![0u8; 4096]).await;
+        assert_eq!(delivered, 0);
+        assert_eq!(removed, vec![addr]);
+        assert!(reg.is_empty());
     }
 
     #[tokio::test]
