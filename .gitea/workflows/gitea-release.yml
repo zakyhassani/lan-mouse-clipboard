@@ -1,0 +1,47 @@
+name: Gitea release build
+run-name: "Release build ${{ github.ref_name }}"
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitea-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libx11-dev libxtst-dev \
+            libadwaita-1-dev libgtk-4-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build tagged release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: scripts/gitea-release-build.sh
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lan-mouse-linux-${{ github.ref_name }}
+          path: target/gitea-release/*
+          if-no-files-found: error
