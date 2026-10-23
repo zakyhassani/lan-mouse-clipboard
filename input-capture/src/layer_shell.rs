@@ -1119,14 +1119,28 @@ impl Dispatch<ZwpLockedPointerV1, ()> for State {
                 // constraints when a layer surface state changes. Re-request
                 // the lock while we are still capturing instead of leaving
                 // the local cursor free to move.
-                if state.capturing && state.unlock_retries < 5 {
-                    state.unlock_retries += 1;
+                if state.capturing {
+                    state.unlock_retries = state.unlock_retries.saturating_add(1);
+                    if state.unlock_retries.is_multiple_of(25) {
+                        log::warn!(
+                            "pointer was unlocked {} times while capturing; still re-locking",
+                            state.unlock_retries
+                        );
+                    }
                     let window = state.focused.clone();
                     let pointer = state.pointer.clone();
                     if let (Some(window), Some(pointer)) = (window, pointer) {
                         if let Some(stale) = state.pointer_lock.take() {
                             stale.destroy();
                         }
+                        // Setting the cursor can itself make Hyprland drop a
+                        // constraint, so do it before requesting the new lock.
+                        pointer.set_cursor(
+                            state.last_enter_serial,
+                            Some(&state.cursor_surface),
+                            0,
+                            0,
+                        );
                         log::debug!("re-locking pointer after compositor unlock");
                         let lock = state.globals.pointer_constraints.lock_pointer(
                             &window.surface,
@@ -1138,12 +1152,6 @@ impl Dispatch<ZwpLockedPointerV1, ()> for State {
                         );
                         state.pointer_lock = Some(lock);
                         state.pointer_lock_requested = true;
-                        pointer.set_cursor(
-                            state.last_enter_serial,
-                            Some(&state.cursor_surface),
-                            0,
-                            0,
-                        );
                         if let Err(e) = state.connection.flush() {
                             log::warn!("failed to flush re-lock request: {e}");
                         }
